@@ -1,62 +1,62 @@
 # Lockstep
 
-**A robot message bus where the entire run is bit-exactly reproducible.**
+A C++20 message bus for robots, built so that an entire run can be replayed bit
+for bit.
 
-Record a robot's execution, replay it offline, and every node re-executes with
-identical inputs in identical order and produces byte-identical output — while
-the bus underneath is zero-copy, crash-tolerant, and deadline-scheduled.
+You record a run. Later you replay it, and every node re-executes on the same
+inputs in the same order and produces byte-identical output. Underneath it all,
+the transport is zero-copy shared memory that keeps working when a publisher
+gets killed halfway through a write.
 
-Fast pub/sub already exists. What no open-source middleware gives you is the
-thing every serious autonomy company builds internally: when the robot does
-something wrong at 3pm on Tuesday, you need to make it do the exact same wrong
-thing again on your laptop. Determinism is the goal here; zero copy is the
-mechanism that makes it affordable.
+Fast pub/sub is a solved problem. The thing you can't get off the shelf is
+reproducibility. When a robot does something wrong at 3pm on a Tuesday, you need
+to make it do the same wrong thing again on your laptop, and that is what this
+is for. Zero copy is in here because it's what makes recording every message
+affordable, not because throughput is the point.
 
-> **Status: phase 1 of 8 complete.** The relocatable type layer is built,
-> tested, and passing — 9/9 tests including 3 negative compile tests. The
-> shared-memory transport, executor, and replay engine are designed but not yet
-> written. Everything claimed below as *built* is in this repository and runs;
-> everything else is explicitly marked planned. No benchmark numbers are quoted
-> until there is something to benchmark.
+> **Where this actually is: phase 1 of 8.** The relocatable type layer is
+> written and passing, 9 tests including 3 that assert code *fails* to compile.
+> The shared memory transport, the executor and the replay engine are designed
+> but not built yet. Anything below marked "built" is in this repo and runs.
+> Everything else says planned. I'm not quoting benchmark numbers until there's
+> something real to benchmark.
 
----
+## Contents
 
-## Table of Contents
-
-- [The Problem](#the-problem)
-- [Design](#design)
-- [Phase 1: The Relocatable Type Layer](#phase-1-the-relocatable-type-layer)
-- [What the Type System Rejects](#what-the-type-system-rejects)
-- [A Provenance Miscompile, and the Fix](#a-provenance-miscompile-and-the-fix)
-- [Building and Testing](#building-and-testing)
-- [Project Structure](#project-structure)
+- [The problem](#the-problem)
+- [How it fits together](#how-it-fits-together)
+- [Phase 1: the type layer](#phase-1-the-type-layer)
+- [What won't compile](#what-wont-compile)
+- [The bug that ate an afternoon](#the-bug-that-ate-an-afternoon)
+- [Build and test](#build-and-test)
+- [Layout](#layout)
 - [Roadmap](#roadmap)
-- [Prior Art](#prior-art)
+- [Prior art](#prior-art)
 
----
+## The problem
 
-## The Problem
+Say you have a perception to control stack moving 24 MB camera frames between
+processes at 30 Hz. Three things tend to go wrong.
 
-A perception-to-control stack passes 24 MB camera frames between processes at
-30 Hz. Three things go wrong with the usual answers:
+**DDS copies.** Fast-DDS and Cyclone serialize the message, copy it into a
+transport buffer, then copy it out the other side. At 24 MB the copies alone eat
+the latency budget and wreck the tail.
 
-1. **DDS copies.** Fast-DDS and Cyclone serialize the message, copy it into a
-   transport buffer, and copy it out again. At 24 MB the copies alone dominate
-   the latency budget and blow the tail.
-2. **Nothing is reproducible.** ROS 2 bag replay reproduces the *messages*, not
-   the *execution*: callback interleaving, wall-clock reads, and thread
-   scheduling all differ on replay, so the bug you recorded frequently refuses
-   to reappear.
-3. **A crash is unbounded.** Kill a publisher mid-write and the shared state it
-   was touching is left in whatever condition it was in. Subscribers block, or
-   read a torn message, or the segment needs a full teardown.
+**Nothing reproduces.** A ROS 2 bag replays the *messages*. It does not replay
+the *execution*. Callback interleaving, wall clock reads and thread scheduling
+all come out different, so the bug you carefully recorded often just refuses to
+show up again.
 
-Lockstep attacks all three from the same substrate: a shared-memory segment
-where messages are written once in their final location, every dispatch decision
-is journaled, and every slot carries the ownership metadata needed to reclaim it
-from a dead process.
+**A crash is unbounded.** Kill a publisher mid-write and whatever shared state
+it was touching stays however it was left. Subscribers block, or read a torn
+message, or you tear the whole segment down and restart everything.
 
-## Design
+All three come back to the same substrate, so that's where Lockstep attacks
+them: one shared memory segment where a message is written once in its final
+location, every dispatch decision goes into a journal, and every slot carries
+enough ownership metadata to be reclaimed from a process that died holding it.
+
+## How it fits together
 
 ```
  ┌──────── process A ────────┐   ┌──────── process B ────────┐
@@ -74,46 +74,47 @@ from a dead process.
                       → replay engine → bit-exact re-execution
 ```
 
-The five pillars, in dependency order:
+Five pieces, in the order they have to be built:
 
-| # | Pillar | Status |
-|---|--------|--------|
+| # | Piece | Status |
+|---|-------|--------|
 | 1 | Relocatable zero-copy types | **built** |
-| 2 | Shared-memory arena + MPMC ring, model-checked | planned |
+| 2 | Shared memory arena + MPMC ring, model checked | planned |
 | 3 | Crash consistency (orphan reclamation, robust futexes) | planned |
-| 4 | Deterministic record & replay | planned |
-| 5 | Deadline-aware executor + response-time analysis | planned |
+| 4 | Deterministic record and replay | planned |
+| 5 | Deadline aware executor + response time analysis | planned |
 
-## Phase 1: The Relocatable Type Layer
+## Phase 1: the type layer
 
-A shared-memory segment maps at a **different base address in every process**.
-A `std::string`, a `std::vector`, or any raw pointer written by the publisher is
-therefore meaningless to the subscriber — it encodes an address in an address
-space the reader does not have. The entire type layer exists to make that class
-of bug a compile error.
+A shared memory segment maps at a **different base address in every process**.
+That one fact is why you can't just put a `std::string` or a `std::vector` or
+any raw pointer into a message. Those all encode an address, and the address is
+meaningless in the process reading it. This whole layer exists to turn that
+class of bug into a compile error instead of a Tuesday afternoon.
 
-### `ls::offset_ptr<T>` — a pointer that survives relocation
+### `ls::offset_ptr<T>`
 
-Stores a signed byte offset from its own address rather than an absolute
-address. When the enclosing block is copied elsewhere, the pointer and its
-target move by the same delta, so the offset stays correct and **the raw bytes
-never have to be rewritten**:
+Stores a signed byte offset from its own address instead of an absolute address.
+Copy the enclosing block somewhere else and both the pointer and its target move
+by the same amount, so the offset is still right and the bytes never need
+patching:
 
 ```cpp
-std::memcpy(dst_block, src_block, block_size);   // every internal link intact
+std::memcpy(dst_block, src_block, block_size);   // all internal links survive
 ```
 
-Unlike `boost::interprocess::offset_ptr`, copy and assignment are **defaulted**,
-so `offset_ptr` is trivially copyable and the bus can `static_assert` that a
-whole message is memcpy-able and treat it as bytes. The tradeoff is explicit:
-lifting a single `offset_ptr` out of its block is a bug, and `.get()` is the
-supported way to leave.
+One deliberate difference from `boost::interprocess::offset_ptr`: copy and
+assignment are defaulted here, which keeps `offset_ptr` trivially copyable so
+the bus can `static_assert` that a whole message is memcpy-able and then treat
+it as bytes. Boost recomputes on copy instead. The price of my choice is that
+lifting a single `offset_ptr` out of its block gives you a dangling pointer, so
+`.get()` is the supported way out.
 
-### `LOCKSTEP_MESSAGE` — opt-in with proof obligations
+### `LOCKSTEP_MESSAGE`
 
-C++20 has no reflection, so a struct cannot be inspected for hidden pointers.
-Lockstep inverts the default instead: **class types are not relocatable unless
-declared**, and the declaration checks every member.
+C++20 has no reflection, so there is no way to walk a struct looking for hidden
+pointers. So the default is flipped: class types are **not** relocatable unless
+you declare them, and declaring them is what runs the checks.
 
 ```cpp
 struct CameraFrame {
@@ -126,11 +127,12 @@ struct CameraFrame {
 LOCKSTEP_MESSAGE(CameraFrame, stamp_ns, width, height, frame_id, pixels);
 ```
 
-That single line static_asserts that every member is relocatable, that the type
-is standard-layout, trivially copyable and trivially destructible, and that the
-field list **accounts for every byte of the struct** — then computes a 64-bit
-layout hash the two peers exchange at connect time, so a stale node cannot
-misread a struct that was reordered under it.
+That one line asserts every member is relocatable, that the type is standard
+layout, trivially copyable and trivially destructible, and that your field list
+**accounts for every byte of the struct** (forget a member and it won't build).
+Then it computes a 64-bit layout hash that the two peers will trade at connect
+time, so a node built against a stale header can't quietly misread a struct
+somebody reordered.
 
 ```
 $ ./example_message_layout
@@ -144,32 +146,33 @@ CameraFrame
   48     16     pixels         struct ls::shm_span<unsigned char>
 ```
 
-`padding yes` is not cosmetic. Interior padding bytes are indeterminate, so a
-message that has any **must be zero-filled before publish** or a replay hash
-taken over the slot will not reproduce. The traits report it so the publisher
-can enforce it.
+That `padding yes` matters more than it looks. Padding bytes are indeterminate,
+so any message that has some has to be zero filled before publish, otherwise a
+replay hash taken over the slot won't reproduce. The traits report it so the
+publisher can enforce it.
 
 ### Containers
 
-| Type | Storage | Use for |
-|------|---------|---------|
-| `inline_vector<T, N>` | inline, fixed capacity | bounded lists in a message |
+| Type | Storage | Good for |
+|------|---------|----------|
+| `inline_vector<T, N>` | inline, fixed capacity | bounded lists inside a message |
 | `inline_string<N>` | inline, fixed capacity | frame ids, sensor names |
-| `shm_span<T>` | `offset_ptr` + length | large payloads in the arena |
+| `shm_span<T>` | `offset_ptr` + length | big payloads out in the arena |
 
-A 24 MB frame has no business inside a fixed-size message slot, so
+A 24 MB frame has no business sitting inside a fixed size message slot, so
 `CameraFrame` stays **64 bytes** and the pixels live in the arena with a span
 pointing at them.
 
-All three zero their unused capacity rather than merely resetting a length.
-That is a determinism requirement, not tidiness: a recycled slot that leaks the
-previous message's bytes would change a replay hash taken over the whole slot.
+All three zero out their unused capacity instead of just resetting a length.
+That's a determinism requirement rather than tidiness: a recycled slot still
+holding the previous message's bytes would change a replay hash taken over the
+whole slot.
 
-## What the Type System Rejects
+## What won't compile
 
-Three negative compile tests assert that the following **fail to build**. CTest
-runs them with `WILL_FAIL`, so a regression that lets them through is a test
-failure.
+Three negative tests assert that the following code **fails to build**. CTest
+runs them with `WILL_FAIL`, so if a change ever lets one of them through, that's
+a failing test.
 
 ```cpp
 struct HasRawPointer { std::uint64_t stamp; const std::uint8_t* pixels; };
@@ -191,44 +194,44 @@ error C2338: LOCKSTEP_MESSAGE(MissingAField): the field list does not account
 for every byte of the struct. List every member, in declaration order.
 ```
 
-A `std::string` member trips three assertions at once: not relocatable, not
-trivially copyable, not trivially destructible.
+A `std::string` member manages to trip three assertions at once: not
+relocatable, not trivially copyable, not trivially destructible.
 
-## A Provenance Miscompile, and the Fix
+## The bug that ate an afternoon
 
-The first optimized build produced wrong code. On MSVC 19.29 at `/O2`:
+The first optimized build produced wrong code. MSVC 19.29, `/O2`:
 
 ```cpp
 int x = 42;
 offset_ptr<int> p = &x;
 *p = 43;
-assert(x == 43);        // FAILED at /O2, passed at /Od
+assert(x == 43);        // failed at /O2, passed at /Od
 ```
 
-**Cause.** Reconstructing a pointer from a stored offset is pointer arithmetic
-whose base is a known object — the `offset_ptr` itself, 8 bytes wide. The
-compiler is entitled to assume such arithmetic stays inside that object, and
-therefore that a store through the result cannot alias anything else. So the
-read of `x` was served from a cached 42.
+Reconstructing a pointer from a stored offset is pointer arithmetic, and its
+base is a known object: the `offset_ptr` itself, all 8 bytes of it. A compiler
+is allowed to assume that arithmetic stays inside that object, and therefore
+that a store through the result can't alias anything else. So the read of `x`
+came back as a cached 42.
 
-The obvious diagnosis — escape analysis deciding `x` never escapes — is wrong,
-and testing it is what made that clear. None of these fixed it:
+My first guess was escape analysis deciding `x` never escapes. That guess was
+wrong, and finding out took four attempts that all did nothing:
 
 | Attempt | Result |
 |---|---|
 | `char*` arithmetic instead of an `intptr_t` round trip | still broken |
 | `__declspec(noinline)` encode, so the address reaches an opaque callee | still broken |
-| Storing the target address through a `volatile` file-scope pointer | still broken |
+| Store the target address through a `volatile` file scope pointer | still broken |
 | `_ReadWriteBarrier()`, `std::atomic_signal_fence(acq_rel)` | still broken |
 
-Passing the address to an opaque callee not fixing it is what ruled escape
-analysis out: the target *did* escape, and the store was still dropped.
+Rows two and three are what killed the escape analysis theory. The address
+genuinely escaped and the store still got dropped.
 
-**Fix.** Launder the *base* of the arithmetic so the compiler stops attributing
-the result to the base object. Three constructs work — `std::launder`, a
-`noinline` identity on the base, and a `volatile` round trip on the base — and
-`std::launder` is the only one that costs nothing: it emits no instruction and
-only blocks the provenance inference.
+What works is laundering the *base* of the arithmetic so the compiler stops
+attributing the result to the base object. Three things do that: `std::launder`,
+a `noinline` identity function on the base, and a `volatile` round trip on the
+base. Only `std::launder` is free, since it emits no instruction at all and just
+blocks the inference:
 
 ```cpp
 template <class T>
@@ -237,28 +240,28 @@ inline T* launder_offset(void* base, std::int64_t offset) noexcept {
 }
 ```
 
-`tests/test_provenance.cpp` pins this down with the cross-object cases that
-miscompiled. Reverting `launder_offset` to the naive form fails that test at
-`/O2` — verified, so the regression test is known to actually catch the bug
-rather than passing vacuously.
+`tests/test_provenance.cpp` covers the cross-object cases that used to
+miscompile. I checked it actually catches the bug by reverting `launder_offset`
+to the naive version and confirming the test fails at `/O2`, because a
+regression test that passes either way is worth nothing.
 
-Separately, and for a different reason, **an `offset_ptr` and its target must
-live in the same relocatable block**: relocation copies a block's bytes
-elsewhere, so an offset reaching outside the block lands on whatever happens to
-sit at that address in the destination. That is a semantic invariant the arena
-enforces, not a codegen hazard, and it survives the fix above.
+There is a second, unrelated rule that still holds: **an `offset_ptr` and its
+target have to live in the same relocatable block.** Relocation copies a block's
+bytes somewhere else, so an offset that reaches outside the block will land on
+whatever happens to sit at that address in the destination. That one is
+semantics, not codegen, and the arena is what will enforce it.
 
-## Building and Testing
+## Build and test
 
-Requires CMake 3.20+ and a C++20 compiler. Developed against MSVC 19.29
+You need CMake 3.20 or newer and a C++20 compiler. I develop against MSVC 19.29
 (Visual Studio 2019 Build Tools, x64).
 
 ```bat
-scripts\build.bat            :: configure + build
-scripts\test.bat             :: build + ctest, including negative compile tests
+scripts\build.bat            :: configure and build
+scripts\test.bat             :: build, then ctest including the negative tests
 ```
 
-Or directly, from a developer command prompt:
+Or by hand, from a developer command prompt:
 
 ```bat
 cmake -S . -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -266,8 +269,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-`/Zc:preprocessor` is required and set by CMake: `LOCKSTEP_MESSAGE` relies on
-conformant `__VA_ARGS__` expansion, which the legacy MSVC preprocessor breaks.
+CMake sets `/Zc:preprocessor` and it is not optional. `LOCKSTEP_MESSAGE` needs
+conformant `__VA_ARGS__` expansion and the legacy MSVC preprocessor breaks it.
 
 ```
 100% tests passed, 0 tests failed out of 9
@@ -283,56 +286,57 @@ conformant `__VA_ARGS__` expansion, which the legacy MSVC preprocessor breaks.
     compile_fail.std_string_field .....   Passed
 ```
 
-## Project Structure
+## Layout
 
 ```
 include/lockstep/
-  core/offset_ptr.hpp       self-relative pointer + the relocation invariant
+  core/offset_ptr.hpp       self-relative pointer, and the rules for using it
   core/relocatable.hpp      is_relocatable / Relocatable / ZeroCopyable
   core/message.hpp          LOCKSTEP_MESSAGE and message_traits
-  core/layout_hash.hpp      FNV-1a over the field table, coverage + padding checks
-  core/type_name.hpp        compile-time type names for the hash
+  core/layout_hash.hpp      FNV-1a over the field table, coverage and padding checks
+  core/type_name.hpp        compile-time type names to feed the hash
   containers/               inline_vector, inline_string, shm_span
 tests/
-  test_*.cpp                positive tests, plain executables driven by CTest
-  negative/*.cpp            must fail to compile; CTest asserts WILL_FAIL
+  test_*.cpp                plain executables, run by CTest
+  negative/*.cpp            must fail to compile, CTest asserts WILL_FAIL
   support/block.hpp         aligned allocation standing in for a mapped segment
 examples/
   01_message_layout.cpp     dumps the field table and layout hash
 ```
 
-Tests are plain executables rather than a framework, so the tree configures and
-builds with nothing but CMake and a compiler.
+Tests are plain executables rather than a framework, so the tree builds with
+nothing but CMake and a compiler.
 
 ## Roadmap
 
-| Phase | Work | Deliverable |
-|-------|------|-------------|
+| Phase | Work | What it produces |
+|-------|------|------------------|
 | 1 | Relocatable types, layout hash, negative tests | **done** |
-| 2 | Shared-memory arena, slab pools, topic registry | segment two processes can map |
-| 3 | MPMC ring protocol + TLA+ / CDSChecker model check | published protocol spec |
-| 4 | `loan()` / `publish()` / `subscribe()` | true zero copy, no memcpy |
-| 5 | Crash consistency: orphan reclamation, heartbeats | 10k `SIGKILL` injections, zero corruptions |
-| 6 | Deadline executor: `SCHED_DEADLINE`, zero post-init alloc | zero deadline misses under load |
-| 7 | Journal + replay + bit-exact output hashing | 1000 replays, 100% hash match |
-| 8 | Benchmarks vs Cyclone / Fast-DDS / iceoryx; 5-node demo | latency histograms, crash + replay demo |
+| 2 | Shared memory arena, slab pools, topic registry | a segment two processes can map |
+| 3 | MPMC ring protocol, TLA+ / CDSChecker model check | a published protocol spec |
+| 4 | `loan()` / `publish()` / `subscribe()` | real zero copy, no memcpy |
+| 5 | Crash consistency: orphan reclamation, heartbeats | 10k `SIGKILL` injections, no corruption |
+| 6 | Deadline executor: `SCHED_DEADLINE`, no post-init alloc | no deadline misses under load |
+| 7 | Journal, replay, bit-exact output hashing | 1000 replays, 100% hash match |
+| 8 | Benchmarks vs Cyclone / Fast-DDS / iceoryx, 5-node demo | latency histograms, crash and replay demo |
 
 Real-time numbers will be measured on Linux with `PREEMPT_RT`, isolated cores
-and `mlockall`. Windows and WSL2 are for functional development only; timing
-figures taken there would not be defensible and none will be published.
+and `mlockall`. Windows and WSL2 are for getting the logic right. Timing taken
+there wouldn't hold up, so I'm not going to publish any.
 
-## Prior Art
+## Prior art
 
 [**iceoryx**](https://github.com/eclipse-iceoryx/iceoryx) already does true
-zero-copy shared-memory pub/sub for robotics, and does it well. Lockstep is not
-trying to beat it at throughput. The differentiators are deterministic record
-and replay, explicit crash-consistency guarantees, and a deadline-aware executor
-with analytical response-time bounds — none of which iceoryx provides. Phase 8
+zero-copy shared memory pub/sub for robotics and does it well. I'm not trying to
+beat it on throughput. What it doesn't give you is deterministic record and
+replay, explicit crash-consistency guarantees, or a deadline aware executor with
+analytical response time bounds, and those are the reasons this exists. Phase 8
 benchmarks against it directly.
 
 `boost::interprocess::offset_ptr` is the reference implementation of the
-self-relative pointer idea; Lockstep's differs deliberately in copy semantics,
-for the reason given above.
+self-relative pointer idea. Mine differs on copy semantics for the reason given
+further up.
 
-ROS 2 interop is planned as a bridge node, not a full `rmw` implementation. An
-`rmw` backend is a stretch goal and is deliberately not on the critical path.
+ROS 2 interop is planned as a bridge node rather than a full `rmw`
+implementation. An `rmw` backend would be nice eventually but it is a big
+enough job that I'm keeping it off the critical path.
