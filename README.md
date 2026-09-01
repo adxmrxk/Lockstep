@@ -27,7 +27,6 @@ affordable, not because throughput is the point.
 - [How it fits together](#how-it-fits-together)
 - [Phase 1: the type layer](#phase-1-the-type-layer)
 - [What won't compile](#what-wont-compile)
-- [The bug that ate an afternoon](#the-bug-that-ate-an-afternoon)
 - [Tech stack](#tech-stack)
 - [Build and test](#build-and-test)
 - [Layout](#layout)
@@ -110,6 +109,11 @@ the bus can `static_assert` that a whole message is memcpy-able and then treat
 it as bytes. Boost recomputes on copy instead. The price of my choice is that
 lifting a single `offset_ptr` out of its block gives you a dangling pointer, so
 `.get()` is the supported way out.
+
+The other rule is that an `offset_ptr` and whatever it points at have to sit in
+the same relocatable block. Relocation copies a block's bytes elsewhere, so an
+offset reaching past the end of the block will land on whatever happens to be at
+that address in the destination. The arena enforces this once it exists.
 
 ### `LOCKSTEP_MESSAGE`
 
@@ -198,60 +202,6 @@ for every byte of the struct. List every member, in declaration order.
 A `std::string` member manages to trip three assertions at once: not
 relocatable, not trivially copyable, not trivially destructible.
 
-## The bug that ate an afternoon
-
-The first optimized build produced wrong code. MSVC 19.29, `/O2`:
-
-```cpp
-int x = 42;
-offset_ptr<int> p = &x;
-*p = 43;
-assert(x == 43);        // failed at /O2, passed at /Od
-```
-
-Reconstructing a pointer from a stored offset is pointer arithmetic, and its
-base is a known object: the `offset_ptr` itself, all 8 bytes of it. A compiler
-is allowed to assume that arithmetic stays inside that object, and therefore
-that a store through the result can't alias anything else. So the read of `x`
-came back as a cached 42.
-
-My first guess was escape analysis deciding `x` never escapes. That guess was
-wrong, and finding out took four attempts that all did nothing:
-
-| Attempt | Result |
-|---|---|
-| `char*` arithmetic instead of an `intptr_t` round trip | still broken |
-| `__declspec(noinline)` encode, so the address reaches an opaque callee | still broken |
-| Store the target address through a `volatile` file scope pointer | still broken |
-| `_ReadWriteBarrier()`, `std::atomic_signal_fence(acq_rel)` | still broken |
-
-Rows two and three are what killed the escape analysis theory. The address
-genuinely escaped and the store still got dropped.
-
-What works is laundering the *base* of the arithmetic so the compiler stops
-attributing the result to the base object. Three things do that: `std::launder`,
-a `noinline` identity function on the base, and a `volatile` round trip on the
-base. Only `std::launder` is free, since it emits no instruction at all and just
-blocks the inference:
-
-```cpp
-template <class T>
-inline T* launder_offset(void* base, std::int64_t offset) noexcept {
-  return std::launder(reinterpret_cast<T*>(static_cast<char*>(base) + offset));
-}
-```
-
-`tests/test_provenance.cpp` covers the cross-object cases that used to
-miscompile. I checked it actually catches the bug by reverting `launder_offset`
-to the naive version and confirming the test fails at `/O2`, because a
-regression test that passes either way is worth nothing.
-
-There is a second, unrelated rule that still holds: **an `offset_ptr` and its
-target have to live in the same relocatable block.** Relocation copies a block's
-bytes somewhere else, so an offset that reaches outside the block will land on
-whatever happens to sit at that address in the destination. That one is
-semantics, not codegen, and the arena is what will enforce it.
-
 ## Tech stack
 
 Right now the answer is "C++20 and nothing else", and that's on purpose. A
@@ -261,7 +211,7 @@ header only with no third party libraries at all.
 
 | Component | What I'm using |
 |-----------|----------------|
-| **Language** | C++20. Concepts for the type contracts, `std::launder` for the pointer provenance fix, fold expressions for the field checks, constexpr `string_view` for the layout hash. |
+| **Language** | C++20. Concepts for the type contracts, `std::launder` inside `offset_ptr`, fold expressions for the field checks, constexpr `string_view` for the layout hash. |
 | **Build** | CMake 3.20+. Generator agnostic, though I drive it with NMake Makefiles since the VS generator can't see my Build Tools install. |
 | **Compiler** | MSVC 19.29 (VS 2019 Build Tools, x64), with `/std:c++20 /Zc:preprocessor /permissive- /W4`. GCC and Clang flags are wired up but I haven't got a modern one on this box yet. |
 | **Testing** | CTest driving plain executables. No framework, so the tree builds with just CMake and a compiler. Negative tests use `WILL_FAIL` on the build itself. |
