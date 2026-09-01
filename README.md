@@ -204,33 +204,41 @@ relocatable, not trivially copyable, not trivially destructible.
 
 ## Tech stack
 
-Right now the answer is "C++20 and nothing else", and that's on purpose. A
-message bus is the thing every other process on the robot links against, so
-every dependency I add becomes a dependency for the whole fleet. Phase 1 is
-header only with no third party libraries at all.
+Every row below is marked either **in use**, meaning it is in the repo today and
+running, or **planned**, meaning it is not written yet and I have put the phase
+number next to it. Nothing here is aspirational without being labelled as such.
 
-| Component | What I'm using |
-|-----------|----------------|
-| **Language** | C++20. Concepts for the type contracts, `std::launder` inside `offset_ptr`, fold expressions for the field checks, constexpr `string_view` for the layout hash. |
-| **Build** | CMake 3.20+. Generator agnostic, though I drive it with NMake Makefiles since the VS generator can't see my Build Tools install. |
-| **Compiler** | MSVC 19.29 (VS 2019 Build Tools, x64), with `/std:c++20 /Zc:preprocessor /permissive- /W4`. GCC and Clang flags are wired up but I haven't got a modern one on this box yet. |
-| **Testing** | CTest driving plain executables. No framework, so the tree builds with just CMake and a compiler. Negative tests use `WILL_FAIL` on the build itself. |
-| **Metaprogramming** | A generated 24 arity preprocessor `FOR_EACH`, `__FUNCSIG__` / `__PRETTY_FUNCTION__` scraping for compile time type names, and constexpr FNV-1a for the layout hash. |
-| **Dependencies** | None. |
+### In use today
 
-Later phases are where the systems programming shows up, and most of it is
-platform API rather than libraries:
+Phase 1 is header only with no third party libraries at all, and that is on
+purpose. A message bus is the thing every other process on the robot links
+against, so any dependency I take becomes a dependency for the whole fleet.
 
-| Phase | What it pulls in |
-|-------|------------------|
-| 2 | POSIX `shm_open` + `mmap`, Win32 `CreateFileMapping` for the dev path |
-| 3 | `std::atomic` with explicit memory orders, `atomic_ref`, futex wait/wake |
-| 3 | TLA+ / TLC for the protocol, CDSChecker or relacy for the C++ memory model, ThreadSanitizer for the implementation |
-| 5 | Robust futexes (`PTHREAD_MUTEX_ROBUST`), `pidfd_open` for liveness detection |
-| 6 | Linux `PREEMPT_RT`, `SCHED_DEADLINE` / `SCHED_FIFO`, `isolcpus`, `nohz_full`, `mlockall` |
-| 8 | Cyclone DDS, Fast-DDS and iceoryx to benchmark against, HdrHistogram for the latency numbers |
-| 8 | `rclcpp` for the ROS 2 bridge node |
-| any | GitHub Actions once there is more than one platform to keep green |
+| Component | Status | Detail |
+|-----------|--------|--------|
+| **Language** | in use | C++20. Concepts for the type contracts, `std::launder` inside `offset_ptr`, fold expressions for the field checks, constexpr `string_view` for the layout hash. |
+| **Build** | in use | CMake 3.20+. Generator agnostic, though I drive it with NMake Makefiles since the VS generator cannot see my Build Tools install. |
+| **Compiler** | in use | MSVC 19.29 (VS 2019 Build Tools, x64), with `/std:c++20 /Zc:preprocessor /permissive- /W4`. |
+| **Testing** | in use | CTest driving plain executables. No framework, so the tree builds with just CMake and a compiler. Negative tests use `WILL_FAIL` on the build itself. |
+| **Metaprogramming** | in use | A generated 24 arity preprocessor `FOR_EACH`, `__FUNCSIG__` / `__PRETTY_FUNCTION__` scraping for compile time type names, and constexpr FNV-1a for the layout hash. |
+| **Third party deps** | in use | None, and I intend to keep it that way for the core. |
+| **GCC / Clang** | not yet | Warning flags are wired up in CMake but I have not built with either. The only modern toolchain on this machine is MSVC. |
+
+### Planned, by phase
+
+Most of what is left is platform API rather than libraries, which is the point.
+None of this is in the repo yet.
+
+| Component | Status | Detail |
+|-----------|--------|--------|
+| **Shared memory** | planned, phase 2 | POSIX `shm_open` and `mmap`, plus Win32 `CreateFileMapping` for the development path. |
+| **Lock free primitives** | planned, phase 3 | `std::atomic` with explicit memory orders, `atomic_ref`, futex wait and wake. |
+| **Formal verification** | planned, phase 3 | TLA+ with TLC for the protocol, CDSChecker or relacy for the C++ memory model, ThreadSanitizer for the implementation. |
+| **Crash consistency** | planned, phase 5 | Robust futexes via `PTHREAD_MUTEX_ROBUST`, and `pidfd_open` for liveness detection. |
+| **Real time scheduling** | planned, phase 6 | Linux `PREEMPT_RT`, `SCHED_DEADLINE` and `SCHED_FIFO`, `isolcpus`, `nohz_full`, `mlockall`. |
+| **Benchmarking** | planned, phase 8 | Cyclone DDS, Fast-DDS and iceoryx as the comparison points, HdrHistogram for the latency distributions. |
+| **ROS 2 interop** | planned, phase 8 | `rclcpp` for a bridge node. A full `rmw` backend is a stretch goal, not on the critical path. |
+| **CI** | planned | GitHub Actions, once there is more than one platform worth keeping green. |
 
 ## Build and test
 
