@@ -52,7 +52,8 @@ if(UNIX)
     test_arena
     test_registry
     test_ring
-    test_pubsub)
+    test_pubsub
+    test_executor)
 
   foreach(t IN LISTS LOCKSTEP_SHM_TESTS)
     add_executable(${t} ${t}.cpp)
