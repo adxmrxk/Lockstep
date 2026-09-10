@@ -32,11 +32,28 @@ namespace detail {
 // trip, and a noinline decode, all of which also work but each cost a call or a
 // store on every dereference.
 //
-// tests/test_provenance.cpp pins this down, including the cross-object case
-// that miscompiles without the launder.
+// std::launder is not enough on GCC. GCC 13 at -O2 folds the cross-object case
+// harder than MSVC does -- it defeats not just the store but the `p.get() == &x`
+// comparison itself -- and laundering the result does not stop it. What does is
+// making the base opaque to the optimizer before the arithmetic: an empty asm
+// with the pointer as an in-out register operand forces the value through a
+// register the compiler must treat as unknown, which discards the provenance it
+// was reasoning from. It emits no instruction, same as launder.
+//
+// tests/test_provenance.cpp pins this down on both compilers, including the
+// cross-object case that miscompiles without the barrier.
 template <class T>
 inline T* launder_offset(void* base, std::int64_t offset) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+  // Needed in addition to the encode-side barrier in offset_ptr::reset, not
+  // instead of it: with only this one GCC gets worse, not better, and with only
+  // the encode barrier the cross-object cases still fail. Both ends of the
+  // round trip have to be opaque.
+  asm volatile("" : "+r"(base));
+  return reinterpret_cast<T*>(static_cast<char*>(base) + offset);
+#else
   return std::launder(reinterpret_cast<T*>(static_cast<char*>(base) + offset));
+#endif
 }
 
 }  // namespace detail
@@ -114,7 +131,14 @@ class offset_ptr {
     // derived from a pointer rather than an integer, which is the weaker demand
     // on the optimizer.
     const auto self = reinterpret_cast<const char*>(this);
-    const auto target = reinterpret_cast<const char*>(p);
+    auto target = reinterpret_cast<const char*>(p);
+#if defined(__GNUC__) || defined(__clang__)
+    // Force the target address through an opaque register so the optimizer has
+    // to treat it as escaped. Without this, GCC keeps an address-taken local in
+    // a register, having concluded that turning its address into an integer
+    // offset never produces a pointer that can reach it again.
+    asm volatile("" : "+r"(target));
+#endif
     offset_ = static_cast<std::int64_t>(target - self);
     assert(offset_ != null_offset && "target address aliases the null sentinel");
   }
@@ -147,10 +171,24 @@ class offset_ptr {
   // Exposed for tests and for the wire-format dumper; not part of normal use.
   std::int64_t raw_offset() const noexcept { return offset_; }
 
-  // Widening conversion to a const view of the same target.
-  operator offset_ptr<const T>() const noexcept {
-    return offset_ptr<const T>(static_cast<const T*>(get()));
-  }
+  // A const view of the same target, as a RAW pointer.
+  //
+  // There is deliberately no `operator offset_ptr<const T>()`. There was one,
+  // and it could not be made correct: an offset_ptr returned by value has its
+  // offset computed relative to wherever the return object was built, and this
+  // type is 8 bytes and trivially copyable, so the ABI hands it back in a
+  // register and then stores those bytes at the destination. The offset now
+  // means nothing at its new address. It is the type's own documented hazard --
+  // lifting an offset_ptr out of its storage dangles -- committed by the type
+  // itself.
+  //
+  // It survived for a while because at -O2 the compiler happened to fold the
+  // whole thing into the right answer. AddressSanitizer changed the layout,
+  // the arithmetic stopped landing by luck, and c.get() came back 32 bytes
+  // wrong. tests/test_offset_ptr.cpp pins the correct behaviour down now.
+  //
+  // The supported way out of a block is .get(), which is what this is.
+  const T* const_view() const noexcept { return static_cast<const T*>(get()); }
 
  public:
   // Public so the class stays standard-layout when nested in message structs.

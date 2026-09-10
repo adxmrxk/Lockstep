@@ -1,0 +1,9 @@
+build/
+out/
+.vs/
+.vscode/
+*.user
+CMakeUserPresets.json
+docs/tla/tla2tools.jar
+docs/tla/states/
+docs/tla/*.out

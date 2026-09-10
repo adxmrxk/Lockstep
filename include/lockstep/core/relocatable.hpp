@@ -18,6 +18,8 @@
 #include <type_traits>
 
 #include "lockstep/core/offset_ptr.hpp"
+#include "lockstep/core/padding.hpp"
+#include "lockstep/core/type_tag.hpp"
 
 namespace ls {
 
@@ -35,6 +37,13 @@ struct is_relocatable : detail::relocatable_default<T> {};
 
 template <class T>
 struct is_relocatable<offset_ptr<T>> : std::true_type {};
+
+// Portable identity for a self-relative pointer field.
+template <class T>
+struct type_tag_of<offset_ptr<T>> {
+  static constexpr std::uint64_t value = detail::tag_mix(
+      type_tag_v<T>, detail::tag_mix(std::string_view("optr"), detail::tag_basis));
+};
 
 template <class T, std::size_t N>
 struct is_relocatable<T[N]> : is_relocatable<T> {};
