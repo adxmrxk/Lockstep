@@ -78,8 +78,17 @@ struct ring_slot {
   std::atomic<std::uint64_t> state;  // 2t = writing, 2t+1 = committed
   std::atomic<std::uint32_t> refcnt;
   std::uint32_t owner_pid;
-  std::uint64_t payload_offset;  // segment-relative, 0 when empty
-  std::uint64_t payload_size;
+  // Both offsets are segment-relative and are assigned ONCE, when the topic is
+  // created, then never mutated. Each slot owns its message block and its
+  // payload block for the life of the bus, so publishing allocates nothing and
+  // nothing ever has to be reclaimed. That is what keeps the publish path
+  // bounded, and it is why the seqlock below only has to protect the block's
+  // CONTENTS rather than a changing pointer to it.
+  std::uint64_t payload_offset;  // the T itself
+  std::uint64_t body_offset;     // out-of-line bytes (a frame, a point cloud)
+  std::uint64_t body_capacity;
+
+  std::uint64_t payload_size;  // bytes of body actually used by this message
   std::uint64_t stamp_ns;
   std::uint64_t sequence;  // ticket, duplicated for the journal's benefit
 };
@@ -108,6 +117,7 @@ enum class read_result : std::uint32_t {
 struct ring_view {
   std::uint64_t sequence;
   std::uint64_t payload_offset;
+  std::uint64_t body_offset;
   std::uint64_t payload_size;
   std::uint64_t stamp_ns;
   std::uint32_t owner_pid;
@@ -138,6 +148,8 @@ class ring {
       s.refcnt.store(0, std::memory_order_relaxed);
       s.owner_pid = 0;
       s.payload_offset = 0;
+      s.body_offset = 0;
+      s.body_capacity = 0;
       s.payload_size = 0;
       s.stamp_ns = 0;
       s.sequence = 0;
@@ -202,6 +214,7 @@ class ring {
 
     out.sequence = s.sequence;
     out.payload_offset = s.payload_offset;
+    out.body_offset = s.body_offset;
     out.payload_size = s.payload_size;
     out.stamp_ns = s.stamp_ns;
     out.owner_pid = s.owner_pid;

@@ -20,14 +20,21 @@ struct ImuSample {
 };
 LOCKSTEP_MESSAGE(ImuSample, stamp_ns, ax, ay, az, gx, gy, gz);
 
+// Matches examples/01_message_layout.cpp exactly, which is what makes this a
+// 64-byte message. The five-field version in the README prose is 56 bytes; the
+// 64 figure quoted there comes from this seven-field struct.
 struct CameraFrame {
   std::uint64_t stamp_ns;
   std::uint32_t width;
   std::uint32_t height;
+  std::uint32_t stride;
+  std::uint32_t channels;
   ls::inline_string<16> frame_id;
   ls::shm_span<std::uint8_t> pixels;
 };
-LOCKSTEP_MESSAGE(CameraFrame, stamp_ns, width, height, frame_id, pixels);
+LOCKSTEP_MESSAGE(CameraFrame, stamp_ns, width, height, stride, channels, frame_id,
+                 pixels);
+static_assert(sizeof(CameraFrame) == 64, "CameraFrame is the 64-byte descriptor");
 
 // Same field names and same size as CameraFrame, but width and height are
 // swapped in declaration order. A node built against this header must be
@@ -37,7 +44,13 @@ struct CameraFrameReordered {
   std::uint64_t stamp_ns;
   std::uint32_t height;
   std::uint32_t width;
+  std::uint32_t stride;
+  std::uint32_t channels;
   ls::inline_string<16> frame_id;
   ls::shm_span<std::uint8_t> pixels;
 };
-LOCKSTEP_MESSAGE(CameraFrameReordered, stamp_ns, height, width, frame_id, pixels);
+LOCKSTEP_MESSAGE(CameraFrameReordered, stamp_ns, height, width, stride, channels,
+                 frame_id, pixels);
+static_assert(sizeof(CameraFrameReordered) == sizeof(CameraFrame),
+              "the reordered variant must stay the same size, or the layout-hash "
+              "test would be passing on a size difference instead");
