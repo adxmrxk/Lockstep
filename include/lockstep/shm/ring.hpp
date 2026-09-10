@@ -72,6 +72,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "lockstep/core/atomic_ops.hpp"
+
 namespace ls {
 
 // Slot flag bits.
@@ -197,11 +199,20 @@ class ring {
     s.state.store(2 * ticket, std::memory_order_release);
 
     s.flags.store(0, std::memory_order_relaxed);
-    s.payload_offset = payload_offset;
-    s.payload_size = payload_size;
-    s.owner_pid = pid;
-    s.stamp_ns = stamp_ns;
-    s.sequence = ticket;
+    // Relaxed atomic stores, not plain ones. A subscriber reads these fields
+    // concurrently and relies on the seqlock to decide afterwards whether what
+    // it read was coherent -- which is the correct ALGORITHM but a data race
+    // under the C++ memory model, and therefore undefined behaviour, and
+    // therefore something the optimizer is entitled to ruin. ThreadSanitizer
+    // reports it, correctly. Relaxed atomics make the access race-free by
+    // definition while compiling to exactly the same plain load and store on
+    // x86-64 and AArch64, so the fix costs nothing at runtime. The ordering
+    // that matters is still carried by the state word above and below.
+    detail::relaxed_store(s.payload_offset, payload_offset);
+    detail::relaxed_store(s.payload_size, payload_size);
+    detail::relaxed_store(s.owner_pid, pid);
+    detail::relaxed_store(s.stamp_ns, stamp_ns);
+    detail::relaxed_store(s.sequence, ticket);
 
     s.state.store(2 * ticket + 1, std::memory_order_release);
   }
@@ -229,12 +240,17 @@ class ring {
 
     const std::uint32_t fl = s.flags.load(std::memory_order_acquire);
 
-    out.sequence = s.sequence;
-    out.payload_offset = s.payload_offset;
+    // Relaxed atomic loads, matching the stores in commit(); see the note there.
+    // body_offset and body_capacity are deliberately NOT loaded atomically:
+    // they are assigned once when the topic is created and published to readers
+    // by the release store on topic_entry::ring_offset, so a reader that can see
+    // this ring at all already happens-after those writes.
+    out.sequence = detail::relaxed_load(s.sequence);
+    out.payload_offset = detail::relaxed_load(s.payload_offset);
     out.body_offset = s.body_offset;
-    out.payload_size = s.payload_size;
-    out.stamp_ns = s.stamp_ns;
-    out.owner_pid = s.owner_pid;
+    out.payload_size = detail::relaxed_load(s.payload_size);
+    out.stamp_ns = detail::relaxed_load(s.stamp_ns);
+    out.owner_pid = detail::relaxed_load(s.owner_pid);
 
     // If the word moved while we copied, the publisher overwrote this slot and
     // what we just read is a mix of two messages.

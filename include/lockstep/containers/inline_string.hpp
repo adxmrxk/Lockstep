@@ -11,6 +11,7 @@
 #include <string_view>
 
 #include "lockstep/core/relocatable.hpp"
+#include "lockstep/core/type_tag.hpp"
 
 namespace ls {
 
@@ -59,6 +60,14 @@ template <std::size_t N>
 struct is_relocatable<inline_string<N>> : std::true_type {};
 
 // size_ + data_[N]; anything beyond that is trailing alignment padding.
+// Portable identity: shape and capacity, not the compiler's spelling.
+template <std::size_t N>
+struct type_tag_of<inline_string<N>> {
+  static constexpr std::uint64_t value = detail::tag_mix(
+      static_cast<std::uint64_t>(N),
+      detail::tag_mix(std::string_view("istr"), detail::tag_basis));
+};
+
 template <std::size_t N>
 struct padding_bytes<inline_string<N>>
     : std::integral_constant<std::size_t,

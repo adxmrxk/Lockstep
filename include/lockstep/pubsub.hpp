@@ -259,13 +259,17 @@ class publisher {
     const std::uint64_t ticket = ln.ticket();
     ring_slot& s = ring_.slot(ticket);
 
-    s.payload_size = ln.body_size();
-    s.owner_pid = current_pid();
-    s.stamp_ns = now_ns();
-    s.sequence = ticket;
+    // Relaxed atomic stores for the same reason as ring::commit: a subscriber
+    // reads these concurrently under the seqlock, which is a data race if the
+    // accesses are plain. See the note in shm/ring.hpp.
+    const std::uint64_t stamp = now_ns();
+    detail::relaxed_store(s.payload_size, static_cast<std::uint64_t>(ln.body_size()));
+    detail::relaxed_store(s.owner_pid, current_pid());
+    detail::relaxed_store(s.stamp_ns, stamp);
+    detail::relaxed_store(s.sequence, ticket);
 
     s.state.store(2 * ticket + 1, std::memory_order_release);
-    topic_->heartbeat_ns.store(s.stamp_ns, std::memory_order_relaxed);
+    topic_->heartbeat_ns.store(stamp, std::memory_order_relaxed);
     ++published_;
     return true;
   }

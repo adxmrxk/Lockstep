@@ -13,11 +13,23 @@
 // doubles as the failure value.
 //
 // The free list is a Treiber stack with a 16-bit tag in the high bits of the
-// head to defeat ABA. Reading the `next` link out of a block that another
-// thread has already recycled is safe here in a way it is not in a heap
-// allocator: segment storage is never unmapped while the bus is up, so the read
-// yields a stale-but-valid value and the CAS that follows simply fails and
-// retries.
+// head to defeat ABA. Its `next` links live in a SEPARATE array, not in the
+// first bytes of each free block, which is where the obvious implementation
+// puts them.
+//
+// The obvious implementation has a real bug, and ThreadSanitizer found it here.
+// A thread in allocate() reads the head, then speculatively reads that block's
+// link word before its CAS. If another thread wins the CAS in between, it now
+// owns that block and starts writing a payload into it -- over the very bytes
+// the first thread is reading as a link. The stale read itself is harmless,
+// because the CAS then fails and retries; what is not harmless is that the two
+// threads are touching the same bytes with no synchronisation, one of them
+// writing arbitrary user data. No amount of tagging fixes that, because the
+// tag protects the head, not the block.
+//
+// Keeping the links outside the blocks removes the aliasing entirely: a link
+// word is only ever touched by the allocator, never by a payload. It costs
+// 8 bytes per block, which is the right trade for deleting a class of bug.
 //
 // This is deliberately NOT the MPMC ring protocol. That is phase 3, and it gets
 // a formal model. This is the simpler allocation layer underneath it.
@@ -26,6 +38,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+
+#include "lockstep/core/atomic_ops.hpp"
 
 namespace ls {
 
@@ -37,7 +51,8 @@ inline constexpr std::size_t max_size_classes = 16;
 struct pool_desc {
   std::uint64_t block_size;
   std::uint64_t block_count;
-  std::uint64_t storage_offset;  // segment-relative
+  std::uint64_t storage_offset;  // segment-relative, start of block storage
+  std::uint64_t links_offset;    // segment-relative, block_count uint64 links
   std::atomic<std::uint64_t> free_head;
   std::atomic<std::uint64_t> live_blocks;
 };
@@ -94,6 +109,9 @@ class arena {
     for (std::size_t i = 0; i < count; ++i) {
       total += detail::align_up(specs[i].block_size, arena_block_align) *
                specs[i].block_count;
+      // Free-list links, held outside the blocks; see the header comment.
+      total += detail::align_up(specs[i].block_count * sizeof(std::uint64_t),
+                                arena_block_align);
     }
     return total;
   }
@@ -119,17 +137,22 @@ class arena {
       p.block_count = specs[i].block_count;
       p.storage_offset = cursor;
       p.live_blocks.store(0, std::memory_order_relaxed);
+      cursor += bs * specs[i].block_count;
 
-      // Thread the free list: block i points at block i+1, last points at 0.
+      // The link array follows the blocks it describes.
+      p.links_offset = cursor;
+      auto* links = reinterpret_cast<std::uint64_t*>(b + cursor);
+
+      // Thread the free list: block k points at block k+1, last points at 0.
       // Indices are stored 1-based so that 0 can mean "empty".
-      for (std::size_t k = 0; k < specs[i].block_count; ++k) {
-        auto* link = reinterpret_cast<std::uint64_t*>(b + cursor + k * bs);
-        *link = (k + 1 < specs[i].block_count) ? (k + 2) : 0;
-      }
+      for (std::size_t k = 0; k < specs[i].block_count; ++k)
+        links[k] = (k + 1 < specs[i].block_count) ? (k + 2) : 0;
+
       p.free_head.store(detail::arena_pack(0, specs[i].block_count ? 1 : 0),
                         std::memory_order_relaxed);
 
-      cursor += bs * specs[i].block_count;
+      cursor += detail::align_up(specs[i].block_count * sizeof(std::uint64_t),
+                                 arena_block_align);
     }
 
     hdr->total_bytes = cursor - arena_offset;
@@ -155,7 +178,11 @@ class arena {
         if (idx == 0) break;  // this class is empty, try the next one up
 
         const std::uint64_t off = p.storage_offset + (idx - 1) * p.block_size;
-        const std::uint64_t next = *reinterpret_cast<std::uint64_t*>(base_ + off);
+        // Relaxed atomic: another thread may be recycling this entry right now.
+        // The value may be stale, in which case the CAS below fails and we
+        // retry -- but the ACCESS must not be a data race.
+        auto* links = reinterpret_cast<std::uint64_t*>(base_ + p.links_offset);
+        const std::uint64_t next = detail::relaxed_load(links[idx - 1]);
         const std::uint64_t updated =
             detail::arena_pack(detail::arena_tag(head) + 1, next);
 
@@ -180,11 +207,11 @@ class arena {
       if (offset < lo || offset >= hi) continue;
 
       const std::uint64_t idx = (offset - lo) / p.block_size + 1;
-      auto* link = reinterpret_cast<std::uint64_t*>(base_ + offset);
+      auto* links = reinterpret_cast<std::uint64_t*>(base_ + p.links_offset);
 
       std::uint64_t head = p.free_head.load(std::memory_order_acquire);
       for (;;) {
-        *link = detail::arena_index(head);
+        detail::relaxed_store(links[idx - 1], detail::arena_index(head));
         const std::uint64_t updated =
             detail::arena_pack(detail::arena_tag(head) + 1, idx);
         if (p.free_head.compare_exchange_weak(head, updated,

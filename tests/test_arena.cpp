@@ -130,6 +130,9 @@ void concurrent_alloc_free_never_double_hands_a_block() {
         }
 
         // Scribble, to catch a block being shared through the data path too.
+        // This writes the block's first 8 bytes, which is exactly where the
+        // free-list link used to live -- and is why ThreadSanitizer flagged
+        // this line before the links were moved into their own array.
         auto* p = f.a.at<std::uint64_t>(off);
         *p = static_cast<std::uint64_t>(t);
 

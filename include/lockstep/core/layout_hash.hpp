@@ -1,5 +1,8 @@
 // core/layout_hash.hpp : FNV-1a over a struct's field layout.
 //
+// Portable across compilers: field identities come from core/type_tag.hpp,
+// which describes what a type IS rather than what a given compiler calls it.
+//
 // Two processes that disagree about a message's layout will silently misread
 // each other's bytes. The bus refuses a connection unless both sides report the
 // same 64-bit layout hash, which covers every field's name, type, offset and
@@ -16,7 +19,8 @@ namespace ls {
 
 struct field_desc {
   std::string_view name;
-  std::string_view type;
+  std::string_view type;  // compiler's spelling, for the human-readable dump
+  std::uint64_t type_tag;  // portable identity, for the hash -- core/type_tag.hpp
   std::size_t offset;
   std::size_t size;
 };
@@ -44,7 +48,10 @@ constexpr std::uint64_t fnv1a(std::uint64_t v, std::uint64_t h) noexcept {
 
 constexpr std::uint64_t hash_field(const field_desc& f, std::uint64_t h) noexcept {
   h = fnv1a(f.name, h);
-  h = fnv1a(f.type, h);
+  // f.type_tag, NOT f.type: the compiler's spelling of a type differs between
+  // toolchains ("unsigned __int64" vs "long unsigned int") and would make two
+  // identical layouts hash differently. See core/type_tag.hpp.
+  h = fnv1a(f.type_tag, h);
   h = fnv1a(static_cast<std::uint64_t>(f.offset), h);
   h = fnv1a(static_cast<std::uint64_t>(f.size), h);
   return h;

@@ -17,6 +17,7 @@
 
 #include "lockstep/core/offset_ptr.hpp"
 #include "lockstep/core/relocatable.hpp"
+#include "lockstep/core/type_tag.hpp"
 
 namespace ls {
 
@@ -68,6 +69,14 @@ struct is_relocatable<shm_span<T>> : is_relocatable<T> {};
 
 // offset_ptr + size_, both 8 bytes: no padding. The element type's own padding
 // does not count, because the elements live in the arena, not in this struct.
+// Portable identity: shape and element identity. Length is runtime state, so
+// it is not part of the type's identity.
+template <class T>
+struct type_tag_of<shm_span<T>> {
+  static constexpr std::uint64_t value = detail::tag_mix(
+      type_tag_v<T>, detail::tag_mix(std::string_view("span"), detail::tag_basis));
+};
+
 template <class T>
 struct padding_bytes<shm_span<T>>
     : std::integral_constant<std::size_t, sizeof(shm_span<T>) - 16u> {};

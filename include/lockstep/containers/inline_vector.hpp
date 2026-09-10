@@ -11,6 +11,7 @@
 #include <cstdint>
 
 #include "lockstep/core/relocatable.hpp"
+#include "lockstep/core/type_tag.hpp"
 
 namespace ls {
 
@@ -99,6 +100,15 @@ template <class T, std::size_t N>
 struct is_relocatable<inline_vector<T, N>> : is_relocatable<T> {};
 
 // size_ + N elements, each of which may carry padding of its own.
+// Portable identity: shape, element identity and capacity.
+template <class T, std::size_t N>
+struct type_tag_of<inline_vector<T, N>> {
+  static constexpr std::uint64_t value = detail::tag_mix(
+      static_cast<std::uint64_t>(N),
+      detail::tag_mix(type_tag_v<T>,
+                      detail::tag_mix(std::string_view("ivec"), detail::tag_basis)));
+};
+
 template <class T, std::size_t N>
 struct padding_bytes<inline_vector<T, N>>
     : std::integral_constant<std::size_t,

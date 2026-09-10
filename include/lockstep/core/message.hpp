@@ -33,6 +33,7 @@
 #include "lockstep/core/padding.hpp"
 #include "lockstep/core/relocatable.hpp"
 #include "lockstep/core/type_name.hpp"
+#include "lockstep/core/type_tag.hpp"
 
 namespace ls {
 
@@ -51,6 +52,7 @@ concept Message = message_traits<T>::declared && ZeroCopyable<T>;
 #define LS_MSG_FIELD(Type, member)                                       \
   ::ls::field_desc {                                                     \
     #member, ::ls::type_name<decltype(Type::member)>(),                  \
+        ::ls::type_tag_v<decltype(Type::member)>,                        \
         offsetof(Type, member), sizeof(Type::member)                     \
   }
 
@@ -78,6 +80,13 @@ concept Message = message_traits<T>::declared && ZeroCopyable<T>;
     static constexpr bool has_padding = padding != 0;                          \
     static constexpr std::uint64_t layout_hash =                               \
         ::ls::detail::layout_hash_of(name, size, align, fields);               \
+  };                                                                           \
+  template <>                                                                  \
+  struct type_tag_of<Type> {                                                   \
+    /* A declared message's identity IS its layout hash, so a nested message   \
+       field contributes portably to its parent's hash. */                     \
+    static constexpr std::uint64_t value =                                     \
+        ::ls::message_traits<Type>::layout_hash;                               \
   };                                                                           \
   template <>                                                                  \
   struct is_relocatable<Type>                                                  \

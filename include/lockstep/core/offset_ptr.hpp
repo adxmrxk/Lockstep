@@ -171,10 +171,24 @@ class offset_ptr {
   // Exposed for tests and for the wire-format dumper; not part of normal use.
   std::int64_t raw_offset() const noexcept { return offset_; }
 
-  // Widening conversion to a const view of the same target.
-  operator offset_ptr<const T>() const noexcept {
-    return offset_ptr<const T>(static_cast<const T*>(get()));
-  }
+  // A const view of the same target, as a RAW pointer.
+  //
+  // There is deliberately no `operator offset_ptr<const T>()`. There was one,
+  // and it could not be made correct: an offset_ptr returned by value has its
+  // offset computed relative to wherever the return object was built, and this
+  // type is 8 bytes and trivially copyable, so the ABI hands it back in a
+  // register and then stores those bytes at the destination. The offset now
+  // means nothing at its new address. It is the type's own documented hazard --
+  // lifting an offset_ptr out of its storage dangles -- committed by the type
+  // itself.
+  //
+  // It survived for a while because at -O2 the compiler happened to fold the
+  // whole thing into the right answer. AddressSanitizer changed the layout,
+  // the arithmetic stopped landing by luck, and c.get() came back 32 bytes
+  // wrong. tests/test_offset_ptr.cpp pins the correct behaviour down now.
+  //
+  // The supported way out of a block is .get(), which is what this is.
+  const T* const_view() const noexcept { return static_cast<const T*>(get()); }
 
  public:
   // Public so the class stays standard-layout when nested in message structs.
