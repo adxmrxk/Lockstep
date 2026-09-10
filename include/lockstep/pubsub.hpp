@@ -55,6 +55,7 @@
 #include <string>
 #include <string_view>
 
+#include "lockstep/core/clock.hpp"
 #include "lockstep/shm/bus.hpp"
 #include "lockstep/shm/ring.hpp"
 
@@ -63,13 +64,6 @@
 #endif
 
 namespace ls {
-
-inline std::uint64_t now_ns() noexcept {
-  return static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now().time_since_epoch())
-          .count());
-}
 
 // ---------------------------------------------------------------------------
 // loan: a writable message sitting in its final location in shared memory.

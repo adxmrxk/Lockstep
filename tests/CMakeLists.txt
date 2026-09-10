@@ -53,7 +53,8 @@ if(UNIX)
     test_registry
     test_ring
     test_pubsub
-    test_executor)
+    test_executor
+    test_replay)
 
   foreach(t IN LISTS LOCKSTEP_SHM_TESTS)
     add_executable(${t} ${t}.cpp)
