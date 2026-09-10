@@ -67,6 +67,20 @@ if(UNIX)
   target_link_libraries(two_process_child PRIVATE ${LOCKSTEP_SHM_LIBS})
   target_include_directories(two_process_child PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
+  # Phase 5: crash consistency. Needs its own victim binary to SIGKILL.
+  add_executable(crash_publisher_child crash_publisher_child.cpp)
+  target_link_libraries(crash_publisher_child PRIVATE ${LOCKSTEP_SHM_LIBS})
+  target_include_directories(crash_publisher_child PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+  add_executable(test_crash_consistency test_crash_consistency.cpp)
+  target_link_libraries(test_crash_consistency PRIVATE ${LOCKSTEP_SHM_LIBS})
+  target_include_directories(test_crash_consistency PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_definitions(test_crash_consistency PRIVATE
+    LOCKSTEP_CRASH_CHILD_BINARY="$<TARGET_FILE:crash_publisher_child>")
+  add_dependencies(test_crash_consistency crash_publisher_child)
+  add_test(NAME test_crash_consistency COMMAND test_crash_consistency)
+  set_tests_properties(test_crash_consistency PROPERTIES TIMEOUT 600)
+
   add_executable(test_two_process test_two_process.cpp)
   target_link_libraries(test_two_process PRIVATE ${LOCKSTEP_SHM_LIBS})
   target_include_directories(test_two_process PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

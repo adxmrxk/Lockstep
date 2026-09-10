@@ -74,10 +74,21 @@
 
 namespace ls {
 
+// Slot flag bits.
+//
+// slot_abandoned marks a slot whose publisher died between claiming it and
+// committing it. The reaper cannot simply commit such a slot -- that would
+// publish half-written bytes -- so it commits it AND flags it, which stops
+// readers waiting on a ticket that will never arrive without making them
+// trust its contents. See shm/liveness.hpp.
+inline constexpr std::uint32_t slot_abandoned = 1u;
+
 struct ring_slot {
   std::atomic<std::uint64_t> state;  // 2t = writing, 2t+1 = committed
   std::atomic<std::uint32_t> refcnt;
+  std::atomic<std::uint32_t> flags;
   std::uint32_t owner_pid;
+  std::uint32_t reserved;
   // Both offsets are segment-relative and are assigned ONCE, when the topic is
   // created, then never mutated. Each slot owns its message block and its
   // payload block for the life of the bus, so publishing allocates nothing and
@@ -107,9 +118,10 @@ static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
 // What a subscriber got back from one read attempt.
 enum class read_result : std::uint32_t {
   ok = 0,
-  empty,     // nothing published at this cursor yet
-  overrun,   // the publisher lapped us; the cursor has been moved forward
-  retry,     // torn read, the caller should try again
+  empty,      // nothing published at this cursor yet
+  overrun,    // the publisher lapped us; the cursor has been moved forward
+  retry,      // torn read, the caller should try again
+  abandoned,  // the publisher died mid-write here; slot skipped, cursor moved
 };
 
 // One message, copied out of a slot by value. Small and trivially copyable:
@@ -146,7 +158,9 @@ class ring {
       ring_slot& s = hdr->slots[i];
       s.state.store(0, std::memory_order_relaxed);
       s.refcnt.store(0, std::memory_order_relaxed);
+      s.flags.store(0, std::memory_order_relaxed);
       s.owner_pid = 0;
+      s.reserved = 0;
       s.payload_offset = 0;
       s.body_offset = 0;
       s.body_capacity = 0;
@@ -182,6 +196,7 @@ class ring {
 
     s.state.store(2 * ticket, std::memory_order_release);
 
+    s.flags.store(0, std::memory_order_relaxed);
     s.payload_offset = payload_offset;
     s.payload_size = payload_size;
     s.owner_pid = pid;
@@ -212,6 +227,8 @@ class ring {
       return read_result::overrun;
     }
 
+    const std::uint32_t fl = s.flags.load(std::memory_order_acquire);
+
     out.sequence = s.sequence;
     out.payload_offset = s.payload_offset;
     out.body_offset = s.body_offset;
@@ -225,6 +242,9 @@ class ring {
     if (s2 != s1) return read_result::retry;
 
     ++cursor;
+    // Read inside the seqlock window, so this is the flag that belonged to the
+    // message we just validated rather than to a later one.
+    if ((fl & slot_abandoned) != 0) return read_result::abandoned;
     return read_result::ok;
   }
 

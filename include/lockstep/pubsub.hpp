@@ -246,6 +246,7 @@ class publisher {
     // Claim the slot before touching its contents, so a subscriber reading it
     // right now sees "busy" rather than a half-written message.
     s.state.store(2 * ticket, std::memory_order_release);
+    s.flags.store(0, std::memory_order_relaxed);
 
     auto* msg = bus_->seg().template at<T>(s.payload_offset);
     auto* body = s.body_offset ? bus_->seg().template at<std::uint8_t>(s.body_offset)

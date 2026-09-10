@@ -14,12 +14,19 @@
 #pragma once
 
 #include <atomic>
+#include <cerrno>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string_view>
 
 #include "lockstep/core/message.hpp"
+
+#if !defined(_WIN32)
+#include <sched.h>
+#include <unistd.h>
+#endif
 
 namespace ls {
 
@@ -82,11 +89,82 @@ struct registry_header {
   std::uint32_t capacity;
   std::uint32_t reserved;
   std::atomic<std::uint32_t> used;
+
+  // Serialises topic CREATION only, and holds the creating pid rather than a
+  // bare flag so a process that dies mid-create can be detected and displaced.
+  //
+  // Why a lock at all, when everything else here is lock-free: without one, two
+  // processes announcing the same new topic can both miss it in find() and then
+  // each claim a DIFFERENT slot for the same name. The result is two entries,
+  // two rings, and a publisher and a subscriber that agree on the topic name
+  // while pointing at different memory. A double-checked claim does not fix it
+  // either, because the loser cannot distinguish "no such topic" from "a topic
+  // whose name has been reserved but not yet written".
+  //
+  // This costs nothing that matters: creation happens at node startup, not on
+  // the publish path, which stays lock-free and allocation-free.
+  std::atomic<std::uint32_t> create_lock;
+
   topic_entry topics[max_topics];
 };
 
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
               "registry atomics must be lock-free to be shared across processes");
+
+namespace detail {
+
+inline bool registry_pid_alive(std::uint32_t pid) noexcept {
+#if defined(_WIN32)
+  return pid != 0;
+#else
+  if (pid == 0) return false;
+  return ::kill(static_cast<int>(pid), 0) == 0 || errno == EPERM;
+#endif
+}
+
+inline std::uint32_t registry_self_pid() noexcept {
+#if defined(_WIN32)
+  return 1;
+#else
+  return static_cast<std::uint32_t>(::getpid());
+#endif
+}
+
+// Held across the topic-creation path. Steals the lock from a holder that is no
+// longer alive, so a node killed inside announce() cannot wedge the bus.
+class create_guard {
+ public:
+  explicit create_guard(registry_header& h) noexcept : hdr_(&h) {
+    const std::uint32_t self = registry_self_pid();
+    for (;;) {
+      std::uint32_t expected = 0;
+      if (hdr_->create_lock.compare_exchange_weak(expected, self,
+                                                  std::memory_order_acq_rel,
+                                                  std::memory_order_acquire)) {
+        return;
+      }
+      if (expected != 0 && expected != self && !registry_pid_alive(expected)) {
+        hdr_->create_lock.compare_exchange_strong(expected, self,
+                                                  std::memory_order_acq_rel,
+                                                  std::memory_order_acquire);
+        continue;
+      }
+#if !defined(_WIN32)
+      ::sched_yield();
+#endif
+    }
+  }
+
+  ~create_guard() { hdr_->create_lock.store(0, std::memory_order_release); }
+
+  create_guard(const create_guard&) = delete;
+  create_guard& operator=(const create_guard&) = delete;
+
+ private:
+  registry_header* hdr_;
+};
+
+}  // namespace detail
 
 // A view over a registry_header living inside a mapped segment.
 class registry {
@@ -127,6 +205,18 @@ class registry {
                   "announce<T>() needs a LOCKSTEP_MESSAGE type");
     if (name.size() > max_topic_name) return attach_status::name_too_long;
 
+    // Fast path: the topic already exists, so no lock is needed.
+    if (topic_entry* existing = find(name)) {
+      *out = existing;
+      const attach_status st = verify<T>(*existing);
+      if (st != attach_status::ok) return st;
+      return exclusive ? claim_publisher(*existing, pid) : attach_status::ok;
+    }
+
+    // Creation is serialised; see registry_header::create_lock.
+    detail::create_guard guard(*hdr_);
+
+    // Re-check under the lock: somebody may have created it while we waited.
     if (topic_entry* existing = find(name)) {
       *out = existing;
       const attach_status st = verify<T>(*existing);
