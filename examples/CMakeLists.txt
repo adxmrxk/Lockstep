@@ -1,0 +1,2 @@
+add_executable(example_message_layout 01_message_layout.cpp)
+target_link_libraries(example_message_layout PRIVATE lockstep::lockstep)

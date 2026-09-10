@@ -18,6 +18,7 @@
 #include <type_traits>
 
 #include "lockstep/core/offset_ptr.hpp"
+#include "lockstep/core/padding.hpp"
 
 namespace ls {
 
