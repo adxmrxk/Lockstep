@@ -31,3 +31,45 @@ foreach(t IN LISTS LOCKSTEP_COMPILE_FAIL_TESTS)
                                     --config $<CONFIG>)
   set_tests_properties(compile_fail.${t} PROPERTIES WILL_FAIL TRUE)
 endforeach()
+
+# ---------------------------------------------------------------------------
+# Phase 2: shared memory. POSIX only for now -- the Win32 CreateFileMapping
+# backend is not written, so these targets are skipped on Windows rather than
+# failing the build there.
+# ---------------------------------------------------------------------------
+if(UNIX)
+  find_package(Threads REQUIRED)
+
+  # shm_open lives in librt on glibc older than 2.34, and in libc after it.
+  find_library(LOCKSTEP_RT_LIB rt)
+  set(LOCKSTEP_SHM_LIBS lockstep::lockstep Threads::Threads)
+  if(LOCKSTEP_RT_LIB)
+    list(APPEND LOCKSTEP_SHM_LIBS ${LOCKSTEP_RT_LIB})
+  endif()
+
+  set(LOCKSTEP_SHM_TESTS
+    test_segment
+    test_arena
+    test_registry)
+
+  foreach(t IN LISTS LOCKSTEP_SHM_TESTS)
+    add_executable(${t} ${t}.cpp)
+    target_link_libraries(${t} PRIVATE ${LOCKSTEP_SHM_LIBS})
+    target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME ${t} COMMAND ${t})
+  endforeach()
+
+  # The acceptance test needs a genuinely separate binary to exec, so that the
+  # second process shares no address space with the first.
+  add_executable(two_process_child two_process_child.cpp)
+  target_link_libraries(two_process_child PRIVATE ${LOCKSTEP_SHM_LIBS})
+  target_include_directories(two_process_child PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+  add_executable(test_two_process test_two_process.cpp)
+  target_link_libraries(test_two_process PRIVATE ${LOCKSTEP_SHM_LIBS})
+  target_include_directories(test_two_process PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_definitions(test_two_process PRIVATE
+    LOCKSTEP_CHILD_BINARY="$<TARGET_FILE:two_process_child>")
+  add_dependencies(test_two_process two_process_child)
+  add_test(NAME test_two_process COMMAND test_two_process)
+endif()
