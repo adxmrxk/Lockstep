@@ -136,9 +136,34 @@ void concurrent_announce_of_one_name_yields_one_entry() {
   for (int t = 0; t < kThreads; ++t) LS_CHECK_EQ(got[t], first);
 }
 
+// The ring protocol is only sound with one publisher per topic, so a second
+// one has to be refused here rather than left to corrupt the ring.
+void a_topic_admits_only_one_publisher() {
+  fixture f("exclusive");
+  ls::topic_entry* first = nullptr;
+  ls::topic_entry* second = nullptr;
+
+  LS_CHECK(f.reg.announce<ImuSample>("imu", &first, true, 1001) ==
+           ls::attach_status::ok);
+
+  // A different process claiming the same topic is refused.
+  LS_CHECK(f.reg.announce<ImuSample>("imu", &second, true, 1002) ==
+           ls::attach_status::already_published);
+
+  // The holder re-announcing is idempotent, so a publisher may re-register.
+  LS_CHECK(f.reg.announce<ImuSample>("imu", &first, true, 1001) ==
+           ls::attach_status::ok);
+
+  // A subscriber is unaffected: only publishing is exclusive.
+  ls::topic_entry* sub = nullptr;
+  LS_CHECK(f.reg.attach<ImuSample>("imu", &sub) == ls::attach_status::ok);
+  LS_CHECK_EQ(sub, first);
+}
+
 }  // namespace
 
 int main() {
+  a_topic_admits_only_one_publisher();
   announce_then_find();
   attaching_with_the_right_type_succeeds();
   attaching_with_a_reordered_struct_is_refused();

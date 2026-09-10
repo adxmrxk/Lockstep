@@ -38,6 +38,7 @@ enum class attach_status : std::uint32_t {
   size_mismatch,
   registry_full,
   name_too_long,
+  already_published,
 };
 
 inline const char* to_string(attach_status s) noexcept {
@@ -48,6 +49,7 @@ inline const char* to_string(attach_status s) noexcept {
     case attach_status::size_mismatch: return "message size mismatch";
     case attach_status::registry_full: return "registry full";
     case attach_status::name_too_long: return "topic name too long";
+    case attach_status::already_published: return "topic already has a publisher";
   }
   return "unknown";
 }
@@ -112,15 +114,24 @@ class registry {
 
   // Publisher side: create the topic if it does not exist, or attach to it if
   // it does and the layout agrees.
+  //
+  // `exclusive` claims the topic's single publisher slot. The ring protocol is
+  // only sound with one publisher per topic -- TLC finds a torn read in the
+  // multi-publisher case, see the header comment in shm/ring.hpp -- so the
+  // second publisher is refused rather than allowed to corrupt the ring. Pass
+  // false only to look the topic up without claiming it.
   template <class T>
-  attach_status announce(std::string_view name, topic_entry** out) noexcept {
+  attach_status announce(std::string_view name, topic_entry** out,
+                         bool exclusive = false, std::uint32_t pid = 0) noexcept {
     static_assert(message_traits<T>::declared,
                   "announce<T>() needs a LOCKSTEP_MESSAGE type");
     if (name.size() > max_topic_name) return attach_status::name_too_long;
 
     if (topic_entry* existing = find(name)) {
       *out = existing;
-      return verify<T>(*existing);
+      const attach_status st = verify<T>(*existing);
+      if (st != attach_status::ok) return st;
+      return exclusive ? claim_publisher(*existing, pid) : attach_status::ok;
     }
 
     for (std::uint32_t i = 0; i < hdr_->capacity; ++i) {
@@ -150,7 +161,7 @@ class registry {
       e.state.store(static_cast<std::uint32_t>(topic_state::ready),
                     std::memory_order_release);
       *out = &e;
-      return attach_status::ok;
+      return exclusive ? claim_publisher(e, pid) : attach_status::ok;
     }
     return attach_status::registry_full;
   }
@@ -185,6 +196,18 @@ class registry {
   std::uint32_t capacity() const noexcept { return hdr_->capacity; }
 
  private:
+  // Exactly one process may hold a topic's publisher slot at a time. Claiming
+  // it again from the same pid is idempotent, so a publisher may re-announce.
+  static attach_status claim_publisher(topic_entry& e, std::uint32_t pid) noexcept {
+    std::uint32_t expected = 0;
+    if (e.publisher_pid.compare_exchange_strong(expected, pid,
+                                                std::memory_order_acq_rel,
+                                                std::memory_order_acquire)) {
+      return attach_status::ok;
+    }
+    return (expected == pid) ? attach_status::ok : attach_status::already_published;
+  }
+
   template <class T>
   static attach_status verify(const topic_entry& e) noexcept {
     if (e.layout_hash != message_traits<T>::layout_hash)

@@ -50,7 +50,8 @@ if(UNIX)
   set(LOCKSTEP_SHM_TESTS
     test_segment
     test_arena
-    test_registry)
+    test_registry
+    test_ring)
 
   foreach(t IN LISTS LOCKSTEP_SHM_TESTS)
     add_executable(${t} ${t}.cpp)
