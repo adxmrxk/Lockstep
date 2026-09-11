@@ -1,36 +1,55 @@
 # Lockstep
 
-A C++20 message bus for robots, built so that an entire run can be replayed bit
-for bit.
+[![CI](https://github.com/adxmrxk/Lockstep/actions/workflows/ci.yml/badge.svg)](https://github.com/adxmrxk/Lockstep/actions/workflows/ci.yml)
 
-You record a run. Later you replay it, and every node re-executes on the same
-inputs in the same order and produces byte-identical output. Underneath it all,
-the transport is zero-copy shared memory that keeps working when a publisher
-gets killed halfway through a write.
+**A C++20 message bus that makes robot bugs reproducible.**
 
-Fast pub/sub is a solved problem. The thing you can't get off the shelf is
-reproducibility. When a robot does something wrong at 3pm on a Tuesday, you need
-to make it do the same wrong thing again on your laptop, and that is what this
-is for. Zero copy is in here because it's what makes recording every message
-affordable, not because throughput is the point.
+A robot does something wrong once, on a Tuesday. You replay the logs and it
+behaves perfectly, because logs record what the robot *saw* and not what it
+*decided, or when*. The bug never comes back and you never find it.
 
-> **Where this actually is: phases 1-7 built, phase 8 partly.** 18 tests,
-> including 3 that assert code *fails* to compile, all passing on GCC 13.3.
-> The type layer, the shared-memory transport, the ring protocol, pub/sub,
-> crash consistency, the deadline executor and record/replay are in this repo
-> and run. There is a five-node demo you can watch survive a `SIGKILL`.
+Lockstep records the decisions too -- dispatch order, every clock read, every
+dropped message -- so a recorded run re-executes byte for byte on your laptop.
+The same wrong turn, on demand, as many times as you need to step through it.
+
+Underneath, the transport is zero-copy shared memory that keeps working when a
+publisher is killed halfway through a write. That is not the headline feature --
+it is what makes recording *every* message affordable, and recording everything
+is what makes the replay exact.
+
+Fast pub/sub is a solved problem. Reproducibility is the part you cannot get off
+the shelf.
+
+**You do not have to replace ROS 2 to use it.** A bridge node puts your existing
+ROS 2 topics on the bus, so this is something you run *alongside* a working
+stack rather than something you migrate to. Nobody rewrites a robot to try a
+message bus, and they should not have to.
+
+> **Where this actually is: phases 1-7 built, phase 8 partly.** 19 tests on
+> GCC 13.3 and MSVC 19.29, 20 with a ROS 2 install, three of which assert that
+> code *fails* to compile. The type layer, the shared-memory transport, the ring
+> protocol, pub/sub, crash consistency, the deadline executor and record/replay
+> are in this repo and run. There is a five-node demo you can watch survive a
+> `SIGKILL`, a bridge onto a live ROS 2 graph, a bridge onto a physical Elegoo
+> robot car, and `lockstep_top` for looking inside a running bus.
 >
-> Two things are **not** done and are not implied to be. The real-time
+> One thing is **not** done and is not implied to be. The real-time
 > *guarantee* needs `PREEMPT_RT`, isolated cores and `CAP_SYS_NICE`, none of
 > which this machine has — the executor asks for them, reports that it was
-> refused, and marks its own timing as untrustworthy. And the comparison
-> against Cyclone DDS, Fast-DDS and iceoryx has never been run, because
-> installing them needs root. So there are Lockstep latency numbers below and
-> no comparison numbers, and that is deliberate.
+> refused, and marks its own timing as untrustworthy.
 >
-> **Phase 2 onward is Linux-only.** `shm_open`, `pidfd_open` and robust futexes
-> have no Win32 equivalent worth faking. Windows still builds and runs phase 1
-> (9 tests); everything above it is skipped there.
+> The Cyclone DDS comparison **has** now been run, and the numbers are below.
+> An earlier version of this README said it could not be, because installing
+> Cyclone needs root. That was wrong: the *apt package* needs root, and
+> building from source into `$HOME` does not. iceoryx and Fast-DDS are still
+> not compared.
+>
+> **Both platforms build and run everything.** The transport has a POSIX
+> backend (`shm_open`/`mmap`) and a Win32 one (`CreateFileMapping`), and the
+> multi-process tests run on both -- 18 of 18 on GCC 13.3 and on MSVC 19.29.
+> What is still Linux-only is the real-time story: `SCHED_FIFO`, `mlockall`
+> and `PREEMPT_RT` have no Windows equivalent worth faking, and the executor
+> reports that it did not get them rather than pretending otherwise.
 
 ## Contents
 
@@ -41,6 +60,9 @@ affordable, not because throughput is the point.
 - [Tech stack](#tech-stack)
 - [Build and test](#build-and-test)
 - [Results](#results)
+- [On a real robot](#on-a-real-robot)
+- [Alongside ROS 2](#alongside-ros-2)
+- [Looking inside a running bus](#looking-inside-a-running-bus)
 - [Layout](#layout)
 - [Roadmap](#roadmap)
 - [Prior art](#prior-art)
@@ -234,9 +256,9 @@ against, so any dependency I take becomes a dependency for the whole fleet.
 | **Testing** | in use | CTest driving plain executables. No framework, so the tree builds with just CMake and a compiler. Negative tests use `WILL_FAIL` on the build itself. |
 | **Metaprogramming** | in use | A generated 24 arity preprocessor `FOR_EACH`, `__FUNCSIG__` / `__PRETTY_FUNCTION__` scraping for compile time type names, and constexpr FNV-1a for the layout hash. |
 | **Third party deps** | in use | None, and I intend to keep it that way for the core. |
-| **Shared memory** | in use, phase 2 | POSIX `shm_open` and `mmap`. Win32 `CreateFileMapping` is still unwritten, so phase 2+ is Linux-only. |
+| **Shared memory** | in use, phase 2 | POSIX `shm_open` + `mmap`, and Win32 `CreateFileMapping` + `MapViewOfFile`. Both backends run the full suite, multi-process tests included. |
 | **Lock free primitives** | in use, phase 3 | `std::atomic` with explicit orders: a tagged Treiber stack for the arena free list, a seqlock per ring slot. |
-| **Formal verification** | in use, phase 3 | TLA+ with TLC over the ring protocol. It found a real torn read. CDSChecker, relacy and TSan are still outstanding. |
+| **Formal verification** | in use, phase 3 | TLA+/TLC for the protocol (found a torn read a 60k-message stress test never produced), Relacy for the C++11 memory ordering, and ThreadSanitizer against the real implementation (found two more). Each keeps a deliberately-broken control config that is asserted to fail. CDSChecker is not used; Relacy covers the same ground. |
 | **Crash consistency** | in use, phase 5 | `pidfd_open` with a `kill(pid, 0)` fallback, plus a reaper that heals abandoned ring slots. |
 | **GCC / Clang** | in use | GCC 13.3 is the primary toolchain now; MSVC still builds phase 1. Clang is still untried. |
 
@@ -247,11 +269,11 @@ None of this is in the repo yet.
 
 | Component | Status | Detail |
 |-----------|--------|--------|
-| **Real time scheduling** | requested, refused here | `mlockall` works. `SCHED_FIFO` needs `CAP_SYS_NICE`, and the guarantee needs `PREEMPT_RT` with `isolcpus`. The executor asks, reports the refusal, and marks its timing untrustworthy. |
-| **Benchmarking** | half done | Lockstep's own latency distribution is measured (see Results). Cyclone DDS, Fast-DDS and iceoryx comparisons have never been run: installing them needs root. `scripts/bench-compare.sh` is the starting point and is labelled as never executed. |
+| **Real time scheduling** | requested, refused here | `mlockall` works. `SCHED_FIFO` needs a non-zero `RLIMIT_RTPRIO` (this machine: 0) and the guarantee needs `PREEMPT_RT` (this machine: `5.15.167.4-microsoft-standard-WSL2`). `rt_validate` prints exactly which prerequisite is missing and skips rather than reporting a meaningless number; on an eligible box it asserts on jitter, deadline misses and page faults. |
+| **Benchmarking** | mostly done | Lockstep's own latency distribution, and a Cyclone DDS 0.10.5 baseline measured the same way in the same run — `scripts/bench-compare.sh` builds Cyclone into `$HOME` (no root) and runs both. iceoryx and Fast-DDS are still not compared. |
 | **Memory-model checking** | still planned, phase 3 | CDSChecker or relacy for the C++11 model, ThreadSanitizer against the implementation. The TLA+ model is sequentially consistent, so it does not cover the barriers. |
-| **ROS 2 interop** | planned, phase 8 | `rclcpp` for a bridge node. A full `rmw` backend is a stretch goal, not on the critical path. |
-| **CI** | planned | GitHub Actions, once there is more than one platform worth keeping green. |
+| **ROS 2 interop** | in use | An `rclcpp` bridge node carrying `sensor_msgs/Imu`, `sensor_msgs/Range` and `geometry_msgs/Twist`. Verified against a live ROS 2 Jazzy graph. A full `rmw` backend is still a stretch goal and still off the critical path. |
+| **CI** | in use | GitHub Actions: Linux GCC and Clang, Windows MSVC, TSan, ASan+UBSan, the TLA+ model check, and the 10k SIGKILL soak. The suite is repeated five times per run, because three of this project bugs only showed on repetition. |
 
 ## Build and test
 
@@ -266,12 +288,14 @@ ctest --test-dir build --output-on-failure
 ```
 
 ```
-100% tests passed, 0 tests failed out of 18
+100% tests passed, 0 tests failed out of 19
 ```
 
-**Windows (phase 1 only):** the shared-memory transport is POSIX, so the phase 2+
-targets are behind `if(UNIX)` and MSVC skips them. `scriptsuild.bat` and
-`scripts	est.bat` still work and still give you 9 of 9.
+**Windows:** `scripts\build.bat` and `scripts\test.bat` build and run the
+whole suite under MSVC, 18 of 18, including the two-process and crash tests.
+The Win32 backend maps a page-file-backed section rather than a `/dev/shm`
+object, so there is no name to unlink and nothing stale left behind after a
+crash -- `segment::unlink` is a documented no-op there.
 
 CMake sets `/Zc:preprocessor` on MSVC and it is not optional. `LOCKSTEP_MESSAGE`
 needs conformant `__VA_ARGS__` expansion and the legacy preprocessor breaks it.
@@ -344,11 +368,222 @@ nothing copies the payload. A transport that serialised and copied would show
 this scaling linearly with size — a 1 MB `memcpy` alone is tens of microseconds.
 That flatness is the zero-copy claim, measured.
 
-### What is not measured
+### Against Cyclone DDS
 
-No comparison against Cyclone DDS, Fast-DDS or iceoryx. Installing them needs
-root, which was not available. Until someone runs `scripts/bench-compare.sh`,
-this README quotes no comparison number.
+One run, one machine, same methodology on both sides: writer and reader in a
+single process, timestamp taken immediately before the send and immediately
+after the receive, exact percentiles from a sorted sample vector. Cyclone is
+configured RELIABLE with `KEEP_LAST(16)`, matching the ring depth Lockstep uses.
+Run it yourself with `scripts/bench-compare.sh`.
+
+| Payload | Lockstep p50 | Cyclone DDS p50 | Lockstep p99 | Cyclone p99 |
+|---------|-------------:|----------------:|-------------:|------------:|
+| 32 B    | 0.09 us      | 0.44 us         | 0.12 us      | 1.98 us     |
+| 64 KB   | 0.16 us      | 4.84 us         | 0.35 us      | 11.01 us    |
+| 1 MB    | 0.32 us      | 417.31 us       | 0.81 us      | 812.76 us   |
+
+The ratio at 1 MB is about 1300x, but the ratio is not the interesting part.
+The **shape** is. Across a 32,768x increase in payload, Lockstep goes from
+0.09 us to 0.32 us, because the payload is never copied — only a 64-byte
+descriptor moves. Cyclone goes from 0.44 us to 417 us, because it serialises
+and copies, so its latency tracks the size of the thing being sent.
+
+That is the whole zero-copy argument, and this is it measured against a real
+implementation rather than asserted.
+
+Two caveats worth stating plainly. Neither column is a real-time result: on a
+stock kernel the tail is the scheduler, for both of them equally. And at 32 B
+the gap is only ~5x, because at that size neither transport is doing much —
+Lockstep wins the cases it was designed for, and the small-message case is not
+one of them.
+
+### Real-time behaviour
+
+Not measured here, and the reason is checked rather than assumed. `rt_validate`
+reports on this machine:
+
+```
+  PREREQUISITE           STATUS     VALUE
+  RLIMIT_RTPRIO          MISSING    0
+  PREEMPT_RT kernel      MISSING    5.15.167.4-microsoft-standard-WSL2
+  RLIMIT_MEMLOCK         ok         64 MB
+  SCHED_FIFO granted     MISSING    refused
+  mlockall               ok         yes
+```
+
+`RLIMIT_RTPRIO` of 0 means no process here can obtain `SCHED_FIFO` at any
+priority, root or not, and a WSL2 kernel cannot bound the tail whatever priority
+it is given. So the tool skips and exits 0 rather than printing a figure that
+would not mean anything.
+
+On a machine that does qualify, the same binary stops skipping and starts
+asserting: zero deadline misses at 1 kHz, no page faults after `mlockall`, and
+measured worst-case execution inside the declared deadline. It exits non-zero if
+any of those fails. That is the shape the real-time claim would have to take
+before this README makes one.
+
+### What is still not measured
+
+No comparison against **iceoryx** or **Fast-DDS**. iceoryx is the one that
+matters, since it is also zero-copy and would not show the scaling difference
+above; this README's prior-art section says as much and that has not changed.
+Fast-DDS is not packaged and would need a source build like Cyclone's.
+
+## On a real robot
+
+The bus runs on a computer; the robot is the body attached to it. There is a
+bridge for the **Elegoo Smart Robot Car V4** in [robot/elegoo](robot/elegoo) --
+full setup in [robot/elegoo/README.md](robot/elegoo/README.md).
+
+```
+[Elegoo car]                          [your computer]
+  ESP32  :100  <---- WiFi / TCP ---->  elegoo_bridge
+  UNO R3 (motors, ultrasonic)                |
+                                    robot/range  robot/drive
+                                             |     ^
+                                          avoider (control code)
+```
+
+Nothing runs on the Arduino or the ESP32; they keep their stock firmware.
+Lockstep needs an OS with processes and virtual memory -- which is the entire
+reason `offset_ptr` exists -- and a 2 KB ATmega has neither.
+
+The control node is the point. It subscribes to a distance and publishes two
+motor speeds. It contains no networking, no JSON, and no knowledge that an
+Elegoo car exists, so the same code drives a real car, a simulated one, or a
+recorded journal.
+
+**It works with no robot**, which is how the pipeline was verified:
+
+```sh
+elegoo_bridge --sim --duration 10000        # synthetic sensors
+avoider --duration 8000 --journal drive.jrnl
+avoider --replay drive.jrnl                 # twice: same hash both times
+```
+
+```
+[done] 174 decisions, output hash 5f39c40d1470d372
+[replay] 174 decisions from 348 records, hash 5f39c40d1470d372
+[replay] 174 decisions from 348 records, hash 5f39c40d1470d372
+```
+
+That is not a trivial reproduction. `decide()` deliberately branches on the
+clock -- which way it turns depends on the millisecond -- so if replay did not
+reproduce the clock, the turns would differ and the hashes would not match.
+
+### What is tested, and what needs the car
+
+`test_elegoo` runs in CI with no hardware: every command encoder pinned to an
+exact string, reverse-direction encoding, the motor deadband, rejection of
+implausible ultrasonic readings, and the socket layer driven against a fake
+robot on loopback including connect, framing, fast failure and mid-session
+disconnection.
+
+**Not tested: whether the real firmware agrees with `protocol.hpp`.** That file
+was written from Elegoo's published protocol, not from a packet capture, so all
+of the uncertainty is concentrated in one `profile` struct and
+`elegoo_bridge --probe` prints what your firmware actually replies. If it
+disagrees, you edit that struct and nothing else changes.
+
+## Alongside ROS 2
+
+The bridge is the difference between *"rewrite your robot to try this"* and
+*"run one more process"*. Your ROS 2 nodes do not change:
+
+```
+your ROS 2 nodes  --/imu/data-->  ros_bridge  --ros/imu-->  Lockstep
+                  <--/cmd_vel---              <--ros/cmd_vel--
+```
+
+```sh
+source /opt/ros/jazzy/setup.bash
+ros_bridge --in imu:/imu/data --out twist:/cmd_vel --journal run.jrnl
+```
+
+Now every IMU message your existing stack publishes is also journalled, and that
+journal replays bit for bit. That is the thing `rosbag` cannot do: a bag gives
+the data back but not the timing, so the run diverges and the bug you were
+chasing does not reappear.
+
+Verified against a live ROS 2 Jazzy graph driven by the stock `ros2 topic pub`
+at 20 Hz -- an external ROS node, not this project's code:
+
+```
+TOPIC                   PUB PID    STATE   MESSAGES    RATE/s    RING  OVERRUNS
+ros/imu                    1202    alive         88      20.0     128         0
+
+[done] imu 138, range 0 bridged in; twist 0 bridged out
+```
+
+The 20.0/s there is derived independently, from ring write positions, and agrees
+with the rate ROS was publishing at.
+
+### Why each type is hand-written
+
+There is no generic bridge, and the reason is the whole premise of the project.
+A ROS message is a generated class holding `std::vector` and `std::string` --
+both heap pointers, both refused by `LOCKSTEP_MESSAGE`, because a pointer into
+the publisher's heap means nothing to a subscriber that mapped the segment
+somewhere else.
+
+So each bridged type gets a flat, padding-free struct and an explicit
+conversion. That is a real cost: a new ROS type is a code change, not a config
+line. What it buys is a message that crosses a process boundary with no
+serialisation and no copy, and hashes reproducibly on replay. A generic bridge
+could offer neither.
+
+The conversions are lossy in places, and `test_ros_bridge` pins the losses
+rather than only the round trip:
+
+- IMU covariance is dropped, and the rebuilt message reports `-1` (*unknown*)
+  rather than leaving `0`, which under REP 145 would falsely claim the
+  covariance is known to be exactly zero.
+- `Range.frame_id` is dropped, being a variable-length string, and restored from
+  a fixed frame on the way out.
+- A negative ROS stamp clamps to zero instead of wrapping into a year-2500
+  timestamp.
+
+ROS is optional. Without a ROS 2 install on the prefix path, configure prints a
+skip line and everything else builds unchanged.
+
+## Looking inside a running bus
+
+```sh
+lockstep_top --bus lockstep-robot
+```
+
+```
+lockstep top  bus topdemo   segment 1.3 MB   watching 4s
+
+TOPIC                   PUB PID    STATE   MESSAGES    RATE/s    RING  OVERRUNS        LAYOUT HASH
+robot/range                1145    alive        140      40.0      64         0   a0871b65f0b6f014
+robot/status               1145    alive        140      40.0      16         0   46a5240157e012f1
+robot/drive                1147    alive        140      40.0      32         0   b955f41b0e19927a
+
+POOL        BLOCK     IN USE       OF  USAGE
+0            64 B        112      512  ###.......
+1          4.0 KB          2       64  #.........
+2         64.0 KB          1       16  #.........
+```
+
+Every number here already existed in the segment; none of it cost the publish
+path any bookkeeping. Rates are differenced from ring write positions between
+refreshes.
+
+It is **strictly an observer** -- it never announces a topic, never publishes,
+never takes a slot, never writes a byte. On this bus that matters more than
+usual: announcing a topic in order to inspect it would claim the exclusive
+publisher slot and lock out the real publisher.
+
+The column worth having is `STATE`. A publisher killed with `SIGKILL` shows up
+immediately, before any reaper has run:
+
+```
+robot/range                1173     DEAD         72       0.0      64         0
+```
+
+which is the screen you stare at when a robot stops responding and you do not
+yet know why. `--once` prints a single snapshot for scripts and CI.
 
 ## Layout
 
@@ -362,7 +597,7 @@ include/lockstep/
   core/type_name.hpp        compile-time type names to feed the hash
   core/clock.hpp            the one place a raw time source is read
   containers/               inline_vector, inline_string, shm_span
-  shm/segment.hpp           shm_open + mmap, offset <-> address translation
+  shm/segment.hpp           shm_open+mmap / CreateFileMapping, offset <-> address
   shm/arena.hpp             slab pools, tagged Treiber free list
   shm/registry.hpp          topic table and the layout-hash handshake
   shm/ring.hpp              the broadcast ring protocol
@@ -372,6 +607,21 @@ include/lockstep/
   rt/executor.hpp           fixed-priority dispatch, allocation-free
   rt/response_time.hpp      Joseph-Pandya worst-case response time
   replay/journal.hpp        the journal, deterministic clock, output hashing
+  net/tcp.hpp               the only socket code; used by the robot bridge
+tools/
+  lockstep_top.cpp          live view of a running bus; read-only
+robot/ros2/
+  ros_msgs.hpp              flat, relocatable equivalents of ROS messages
+  convert.hpp               ROS <-> Lockstep, pure functions
+  ros_bridge.cpp            the bridge node
+  test_ros_bridge.cpp       conversion tests; no ROS graph needed
+robot/elegoo/
+  protocol.hpp              the Elegoo wire format, isolated so it is cheap to
+                            correct against real firmware
+  robot_msgs.hpp            RobotRange / RobotDrive / RobotStatus
+  bridge.cpp                puts a physical car on the bus (--sim works with no car)
+  avoider.cpp               obstacle avoidance; records and replays a drive
+  test_elegoo.cpp           protocol and socket tests, no robot required
 tests/
   test_*.cpp                plain executables, run by CTest
   negative/*.cpp            must fail to compile, CTest asserts WILL_FAIL
@@ -386,6 +636,10 @@ examples/
   05_five_node_demo.cpp     five processes, a SIGKILL, and a replay
 benchmarks/
   bench_latency.cpp         latency distribution
+  rt_validate.cpp           names the missing real-time prerequisite, or asserts
+  cyclone/                  the Cyclone DDS baseline, built only if found
+verification/relacy/
+  ring_seqlock.cpp          the memory ordering, which TLA+ cannot check
 ```
 
 Tests are plain executables rather than a framework, so the tree builds with
@@ -402,7 +656,7 @@ nothing but CMake and a compiler.
 | 5 | Crash consistency: orphan reclamation, heartbeats | **done** — 10,000 `SIGKILL` injections, 0 corruption |
 | 6 | Deadline executor, no post-init alloc | **partly** — 0 allocations enforced by a `new` hook; `SCHED_FIFO` refused here |
 | 7 | Journal, replay, bit-exact output hashing | **done** — 1000 replays, 1000 matches |
-| 8 | Benchmarks, 5-node demo | **partly** — demo runs and survives a kill; third-party comparison never run |
+| 8 | Benchmarks, 5-node demo, ROS 2 interop | **partly** — demo runs and survives a kill; measured against Cyclone DDS (0.32 us vs 417 us at 1 MB); ROS 2 bridge built and verified against a live graph; iceoryx and Fast-DDS not compared |
 
 Real-time numbers will be measured on Linux with `PREEMPT_RT`, isolated cores
 and `mlockall`. Windows and WSL2 are for getting the logic right. Timing taken
@@ -421,6 +675,9 @@ benchmarks against it directly.
 self-relative pointer idea. Mine differs on copy semantics for the reason given
 further up.
 
-ROS 2 interop is planned as a bridge node rather than a full `rmw`
-implementation. An `rmw` backend would be nice eventually but it is a big
-enough job that I'm keeping it off the critical path.
+ROS 2 interop is a bridge node rather than a full `rmw` implementation, and it
+is built -- see [Alongside ROS 2](#alongside-ros-2). That was the right order:
+a bridge makes this something you add to a working stack in an afternoon,
+whereas an `rmw` backend asks a team to swap out the layer everything else
+stands on before they have any reason to trust it. The `rmw` backend would
+still be nice eventually; it is still off the critical path.
