@@ -126,10 +126,14 @@ class executor {
             const read_result rr = s->take(smp);
             if (rr == read_result::ok) {
               f(smp);
-            } else if (rr == read_result::retry) {
+            } else if (rr == read_result::retry || rr == read_result::overrun) {
+              // Overrun means read() already advanced the cursor to the oldest
+              // resident message, so keep draining from there. Breaking instead
+              // leaves the cursor pinned behind the trailing edge, where it
+              // overruns again every cycle and delivers nothing.
               continue;
             } else {
-              break;  // empty, overrun (cursor already moved) or abandoned
+              break;  // empty or abandoned
             }
           }
         }});
