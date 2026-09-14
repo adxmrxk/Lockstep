@@ -1,0 +1,18 @@
+// The comparison type for the Cyclone DDS baseline.
+//
+// Deliberately the same shape as the Lockstep messages it is measured against:
+// a timestamp the receiver subtracts from, plus a variable-length payload so
+// one type covers every size in the sweep.
+//
+// A sequence<octet> is the idiomatic DDS way to carry a variable payload, and
+// it is also the honest one for this comparison: it is exactly the construct
+// that forces the serialisation and the copy that Lockstep's shm_span avoids.
+// Replacing it with a fixed-size array would flatter DDS by removing the
+// allocation, and would no longer be the thing a real node would write.
+module bench {
+  struct Msg {
+    unsigned long long stamp_ns;
+    sequence<octet> payload;
+  };
+  #pragma keylist Msg
+};
