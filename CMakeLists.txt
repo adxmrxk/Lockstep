@@ -44,3 +44,6 @@ add_subdirectory(robot/elegoo)
 
 # The ROS 2 bridge, built only when a ROS 2 install is on the prefix path.
 add_subdirectory(robot/ros2)
+
+# Operator tooling: lockstep_top.
+add_subdirectory(tools)

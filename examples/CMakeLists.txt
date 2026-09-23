@@ -30,6 +30,15 @@ if(UNIX OR WIN32)
   add_executable(bench_latency ../benchmarks/bench_latency.cpp)
   target_link_libraries(bench_latency PRIVATE ${LOCKSTEP_DEMO_LIBS})
   target_include_directories(bench_latency PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+  # Reports whether this machine can give a real-time answer at all, and
+  # asserts on the answer when it can. POSIX-only: it reads RLIMIT_RTPRIO and
+  # the kernel version.
+  if(UNIX)
+    add_executable(rt_validate ../benchmarks/rt_validate.cpp)
+    target_link_libraries(rt_validate PRIVATE ${LOCKSTEP_DEMO_LIBS})
+    target_include_directories(rt_validate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  endif()
 endif()
 
 # The optional Cyclone DDS baseline lives beside the Lockstep benchmark.
