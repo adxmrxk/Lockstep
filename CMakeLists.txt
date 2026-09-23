@@ -37,3 +37,10 @@ endif()
 enable_testing()
 add_subdirectory(tests)
 add_subdirectory(examples)
+
+# The robot bridge: puts a physical Elegoo car on the bus. Self-contained, and
+# skipped on any platform without sockets.
+add_subdirectory(robot/elegoo)
+
+# The ROS 2 bridge, built only when a ROS 2 install is on the prefix path.
+add_subdirectory(robot/ros2)
