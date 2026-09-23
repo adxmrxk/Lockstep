@@ -9,17 +9,17 @@
 #include <cstdint>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <vector>
 
 #include "lockstep/shm/ring.hpp"
+#include "lockstep/core/process.hpp"
 #include "lockstep/shm/segment.hpp"
 #include "support/check.hpp"
 
 namespace {
 
 std::string unique_name(const char* tag) {
-  return std::string("lockstep-ring-") + tag + "-" + std::to_string(::getpid());
+  return std::string("lockstep-ring-") + tag + "-" + std::to_string(ls::self_pid());
 }
 
 // Fields are derived from the sequence number, so any inconsistency between

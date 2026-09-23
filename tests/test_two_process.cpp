@@ -12,11 +12,10 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <sys/wait.h>
-#include <unistd.h>
-
+#include "lockstep/core/process.hpp"
 #include "lockstep/shm/bus.hpp"
 #include "support/check.hpp"
+#include "support/process.hpp"
 #include "support/demo_msgs.hpp"
 
 #ifndef LOCKSTEP_CHILD_BINARY
@@ -28,28 +27,15 @@ namespace {
 constexpr std::size_t kPixelBytes = 4096;
 
 int run_child(const std::string& segment_name, std::uint64_t frame_offset) {
-  const std::string off = std::to_string(frame_offset);
-
-  const pid_t pid = ::fork();
-  if (pid < 0) return -1;
-
-  if (pid == 0) {
-    ::execl(LOCKSTEP_CHILD_BINARY, LOCKSTEP_CHILD_BINARY, segment_name.c_str(),
-            off.c_str(), static_cast<char*>(nullptr));
-    // Only reached if exec failed.
-    std::fprintf(stderr, "  exec of %s failed: %s\n", LOCKSTEP_CHILD_BINARY,
-                 std::strerror(errno));
-    ::_exit(127);
-  }
-
-  int status = 0;
-  if (::waitpid(pid, &status, 0) != pid) return -1;
-  if (!WIFEXITED(status)) return -1;
-  return WEXITSTATUS(status);
+  ls::test::child_process c =
+      ls::test::spawn(LOCKSTEP_CHILD_BINARY,
+                      {segment_name, std::to_string(frame_offset)});
+  if (!c.valid()) return -1;
+  return ls::test::wait_for(c);
 }
 
 void a_second_process_reads_what_this_one_published() {
-  const std::string name = "lockstep-2proc-" + std::to_string(::getpid());
+  const std::string name = "lockstep-2proc-" + std::to_string(ls::self_pid());
   ls::segment::unlink(name);
 
   ls::bus b = ls::bus::create(name, {{64, 16}, {4096, 8}});
@@ -58,7 +44,7 @@ void a_second_process_reads_what_this_one_published() {
   ls::topic_entry* topic = nullptr;
   LS_CHECK(b.topics().announce<CameraFrame>("cam/front", &topic) ==
            ls::attach_status::ok);
-  topic->publisher_pid.store(static_cast<std::uint32_t>(::getpid()),
+  topic->publisher_pid.store(ls::self_pid(),
                              std::memory_order_relaxed);
 
   // Payload block: the pixels live out in the arena, not in the message.
@@ -95,7 +81,7 @@ void a_second_process_reads_what_this_one_published() {
   topic->ring_offset.store(frame_off, std::memory_order_release);
 
   std::fprintf(stderr, "  [parent] base=%p pid=%d frame_off=%llu\n", b.seg().base(),
-               static_cast<int>(::getpid()),
+               static_cast<int>(ls::self_pid()),
                static_cast<unsigned long long>(frame_off));
 
   const int rc = run_child(name, frame_off);
@@ -112,7 +98,7 @@ void a_second_process_reads_what_this_one_published() {
 void opening_a_missing_bus_fails() {
   bool threw = false;
   try {
-    ls::bus gone = ls::bus::open("lockstep-does-not-exist-" + std::to_string(::getpid()));
+    ls::bus gone = ls::bus::open("lockstep-does-not-exist-" + std::to_string(ls::self_pid()));
   } catch (const std::exception&) {
     threw = true;
   }

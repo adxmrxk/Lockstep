@@ -21,12 +21,11 @@
 #include <cstring>
 #include <random>
 #include <string>
-#include <sys/wait.h>
-#include <unistd.h>
-
+#include "lockstep/core/process.hpp"
 #include "lockstep/pubsub.hpp"
 #include "lockstep/shm/liveness.hpp"
 #include "support/check.hpp"
+#include "support/process.hpp"
 #include "support/demo_msgs.hpp"
 
 #ifndef LOCKSTEP_CRASH_CHILD_BINARY
@@ -35,20 +34,25 @@
 
 namespace {
 
+// std::getenv is perfectly correct here and MSVC's C4996 objection is about
+// thread-safety in a program that mutates the environment. This one does not.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+inline const char* read_env(const char* name) { return std::getenv(name); }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
 bool coherent(const ImuSample& s) {
   const float f = static_cast<float>(s.stamp_ns & 0xffffu);
   return s.ax == f && s.ay == f && s.az == f && s.gx == f && s.gy == f && s.gz == f;
 }
 
-pid_t spawn(const std::string& segment, unsigned hold_us) {
-  const std::string hold = std::to_string(hold_us);
-  const pid_t pid = ::fork();
-  if (pid == 0) {
-    ::execl(LOCKSTEP_CRASH_CHILD_BINARY, LOCKSTEP_CRASH_CHILD_BINARY,
-            segment.c_str(), hold.c_str(), static_cast<char*>(nullptr));
-    ::_exit(127);
-  }
-  return pid;
+ls::test::child_process spawn_child(const std::string& segment, unsigned hold_us) {
+  return ls::test::spawn(LOCKSTEP_CRASH_CHILD_BINARY,
+                         {segment, std::to_string(hold_us)});
 }
 
 struct totals {
@@ -65,10 +69,10 @@ struct totals {
 };
 
 void sigkill_storm() {
-  const char* iters_env = std::getenv("LOCKSTEP_CRASH_ITERS");
+  const char* iters_env = read_env("LOCKSTEP_CRASH_ITERS");
   const int iters = iters_env ? std::atoi(iters_env) : 250;
 
-  const std::string name = "lockstep-crash-" + std::to_string(::getpid());
+  const std::string name = "lockstep-crash-" + std::to_string(ls::self_pid());
   ls::segment::unlink(name);
   ls::bus b = ls::bus::create(name, {{64, 512}, {4096, 32}, {65536, 8}});
 
@@ -82,19 +86,18 @@ void sigkill_storm() {
   for (int round = 0; round < iters; ++round) {
     ++t.rounds;
 
-    const pid_t child = spawn(name, static_cast<unsigned>(hold_us(rng)));
-    LS_CHECK(child > 0);
-    if (child <= 0) break;
+    ls::test::child_process child =
+        spawn_child(name, static_cast<unsigned>(hold_us(rng)));
+    LS_CHECK(child.valid());
+    if (!child.valid()) break;
 
-    ::usleep(static_cast<useconds_t>(delay_us(rng)));
+    ls::test::sleep_us(static_cast<unsigned>(delay_us(rng)));
 
-    // SIGKILL: no handler, no unwinding, no chance to clean up. This is the
-    // failure mode the phase exists for.
-    ::kill(child, SIGKILL);
-    int status = 0;
-    ::waitpid(child, &status, 0);
+    // The harshest kill each platform has: no handler, no unwinding, no chance
+    // to clean up. This is the failure mode the phase exists for.
+    ls::test::kill_hard(child);
+    ls::test::wait_for(child);
     ++t.killed;
-    LS_CHECK(WIFSIGNALED(status) || WIFEXITED(status));
 
     // Sample AFTER the kill, not before. Not every child survives long enough
     // to claim the topic -- with kill delays down at 200us some die inside
@@ -105,8 +108,7 @@ void sigkill_storm() {
     {
       ls::topic_entry* pre = b.topics().find("imu/crash");
       if (pre != nullptr &&
-          pre->publisher_pid.load(std::memory_order_acquire) ==
-              static_cast<std::uint32_t>(child)) {
+          pre->publisher_pid.load(std::memory_order_acquire) == child.pid) {
         ++t.had_publisher;
       }
     }
@@ -182,27 +184,26 @@ void sigkill_storm() {
 
 // A publisher that dies holding the topic must not lock it out forever.
 void a_dead_publishers_topic_can_be_taken_over() {
-  const std::string name = "lockstep-takeover-" + std::to_string(::getpid());
+  const std::string name = "lockstep-takeover-" + std::to_string(ls::self_pid());
   ls::segment::unlink(name);
   ls::bus b = ls::bus::create(name, {{64, 256}, {4096, 8}, {65536, 4}});
 
-  const pid_t child = spawn(name, 0);
-  LS_CHECK(child > 0);
-  ::usleep(20000);
+  ls::test::child_process child = spawn_child(name, 0);
+  LS_CHECK(child.valid());
+  ls::test::sleep_us(20000);
 
   ls::topic_entry* e = b.topics().find("imu/crash");
   LS_CHECK(e != nullptr);
   const std::uint32_t dead_pid = e->publisher_pid.load();
-  LS_CHECK_EQ(dead_pid, static_cast<std::uint32_t>(child));
+  LS_CHECK_EQ(dead_pid, child.pid);
 
   // Before the kill, this process cannot publish on that topic.
   ls::topic_entry* blocked = nullptr;
   LS_CHECK(b.topics().announce<ImuSample>("imu/crash", &blocked, true, 999999) ==
            ls::attach_status::already_published);
 
-  ::kill(child, SIGKILL);
-  int status = 0;
-  ::waitpid(child, &status, 0);
+  ls::test::kill_hard(child);
+  ls::test::wait_for(child);
 
   // The pid is gone, so the reaper releases the topic.
   LS_CHECK(!ls::process_alive(dead_pid));
@@ -231,7 +232,7 @@ void a_dead_publishers_topic_can_be_taken_over() {
 
 // A slot left mid-write must be skipped, never served as a real message.
 void an_abandoned_slot_is_skipped_not_served() {
-  const std::string name = "lockstep-abandon-" + std::to_string(::getpid());
+  const std::string name = "lockstep-abandon-" + std::to_string(ls::self_pid());
   ls::segment::unlink(name);
   ls::bus b = ls::bus::create(name, {{64, 256}, {4096, 8}, {65536, 4}});
 

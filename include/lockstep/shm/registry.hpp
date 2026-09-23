@@ -22,10 +22,15 @@
 #include <string_view>
 
 #include "lockstep/core/message.hpp"
+#include "lockstep/core/process.hpp"
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <sched.h>
-#include <unistd.h>
 #endif
 
 namespace ls {
@@ -113,29 +118,12 @@ static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
 
 namespace detail {
 
-inline bool registry_pid_alive(std::uint32_t pid) noexcept {
-#if defined(_WIN32)
-  return pid != 0;
-#else
-  if (pid == 0) return false;
-  return ::kill(static_cast<int>(pid), 0) == 0 || errno == EPERM;
-#endif
-}
-
-inline std::uint32_t registry_self_pid() noexcept {
-#if defined(_WIN32)
-  return 1;
-#else
-  return static_cast<std::uint32_t>(::getpid());
-#endif
-}
-
 // Held across the topic-creation path. Steals the lock from a holder that is no
 // longer alive, so a node killed inside announce() cannot wedge the bus.
 class create_guard {
  public:
   explicit create_guard(registry_header& h) noexcept : hdr_(&h) {
-    const std::uint32_t self = registry_self_pid();
+    const std::uint32_t self = ::ls::self_pid();
     for (;;) {
       std::uint32_t expected = 0;
       if (hdr_->create_lock.compare_exchange_weak(expected, self,
@@ -143,13 +131,17 @@ class create_guard {
                                                   std::memory_order_acquire)) {
         return;
       }
-      if (expected != 0 && expected != self && !registry_pid_alive(expected)) {
+      if (expected != 0 && expected != self && !::ls::process_alive(expected)) {
         hdr_->create_lock.compare_exchange_strong(expected, self,
                                                   std::memory_order_acq_rel,
                                                   std::memory_order_acquire);
         continue;
       }
-#if !defined(_WIN32)
+      // Yield rather than spin hot: the holder is alive and will release
+      // shortly, and this path only runs at node startup.
+#if defined(_WIN32)
+      ::SwitchToThread();
+#else
       ::sched_yield();
 #endif
     }

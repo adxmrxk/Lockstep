@@ -31,13 +31,20 @@
 #include "lockstep/core/clock.hpp"
 
 #if defined(_WIN32)
-#error "replay/journal.hpp is POSIX-only for now."
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #endif
-
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace ls {
 
@@ -95,6 +102,31 @@ class journal {
     j.size_ = bytes;
     j.path_ = path;
 
+#if defined(_WIN32)
+    HANDLE f = ::CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) throw_last_error("CreateFile", path);
+
+    // The mapping size sets the file size, so no separate truncate is needed.
+    const DWORD hi = static_cast<DWORD>((static_cast<std::uint64_t>(bytes) >> 32) & 0xffffffffu);
+    const DWORD lo = static_cast<DWORD>(static_cast<std::uint64_t>(bytes) & 0xffffffffu);
+    HANDLE m = ::CreateFileMappingA(f, nullptr, PAGE_READWRITE, hi, lo, nullptr);
+    if (m == nullptr) {
+      const DWORD e = ::GetLastError();
+      ::CloseHandle(f);
+      throw_win32("CreateFileMapping", path, e);
+    }
+    void* p = ::MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+    if (p == nullptr) {
+      const DWORD e = ::GetLastError();
+      ::CloseHandle(m);
+      ::CloseHandle(f);
+      throw_win32("MapViewOfFile", path, e);
+    }
+    j.file_ = f;
+    j.mapping_ = m;
+    j.base_ = static_cast<std::uint8_t*>(p);
+#else
     const int fd = ::open(path.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0644);
     if (fd < 0) throw_errno("open", path);
     if (::ftruncate(fd, static_cast<off_t>(bytes)) != 0) {
@@ -110,6 +142,7 @@ class journal {
     }
     j.fd_ = fd;
     j.base_ = static_cast<std::uint8_t*>(p);
+#endif
 
     auto* h = j.hdr();
     h->magic = journal_magic;
@@ -124,6 +157,36 @@ class journal {
     j.writable_ = false;
     j.path_ = path;
 
+#if defined(_WIN32)
+    HANDLE f = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) throw_last_error("CreateFile", path);
+
+    ::LARGE_INTEGER li{};
+    if (!::GetFileSizeEx(f, &li)) {
+      const DWORD e = ::GetLastError();
+      ::CloseHandle(f);
+      throw_win32("GetFileSizeEx", path, e);
+    }
+    j.size_ = static_cast<std::size_t>(li.QuadPart);
+
+    HANDLE m = ::CreateFileMappingA(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (m == nullptr) {
+      const DWORD e = ::GetLastError();
+      ::CloseHandle(f);
+      throw_win32("CreateFileMapping", path, e);
+    }
+    void* p = ::MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+    if (p == nullptr) {
+      const DWORD e = ::GetLastError();
+      ::CloseHandle(m);
+      ::CloseHandle(f);
+      throw_win32("MapViewOfFile", path, e);
+    }
+    j.file_ = f;
+    j.mapping_ = m;
+    j.base_ = static_cast<std::uint8_t*>(p);
+#else
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) throw_errno("open", path);
     struct ::stat st {};
@@ -141,6 +204,7 @@ class journal {
     }
     j.fd_ = fd;
     j.base_ = static_cast<std::uint8_t*>(p);
+#endif
 
     if (j.hdr()->magic != journal_magic)
       throw std::runtime_error("lockstep: " + path + " is not a lockstep journal");
@@ -219,10 +283,18 @@ class journal {
   }
 
   void close() noexcept {
+#if defined(_WIN32)
+    if (base_ != nullptr) ::UnmapViewOfFile(base_);
+    if (mapping_ != nullptr) ::CloseHandle(mapping_);
+    if (file_ != INVALID_HANDLE_VALUE && file_ != nullptr) ::CloseHandle(file_);
+    mapping_ = nullptr;
+    file_ = INVALID_HANDLE_VALUE;
+#else
     if (base_ != nullptr) ::munmap(base_, size_);
     if (fd_ >= 0) ::close(fd_);
-    base_ = nullptr;
     fd_ = -1;
+#endif
+    base_ = nullptr;
     size_ = 0;
   }
 
@@ -238,21 +310,41 @@ class journal {
   void swap(journal& o) noexcept {
     std::swap(base_, o.base_);
     std::swap(size_, o.size_);
+#if defined(_WIN32)
+    std::swap(file_, o.file_);
+    std::swap(mapping_, o.mapping_);
+#else
     std::swap(fd_, o.fd_);
+#endif
     std::swap(writable_, o.writable_);
     std::swap(cursor_, o.cursor_);
     path_.swap(o.path_);
   }
 
+#if defined(_WIN32)
+  [[noreturn]] static void throw_win32(const char* what, const std::string& p, DWORD e) {
+    throw std::system_error(static_cast<int>(e), std::system_category(),
+                            std::string(what) + " failed for journal " + p);
+  }
+  [[noreturn]] static void throw_last_error(const char* what, const std::string& p) {
+    throw_win32(what, p, ::GetLastError());
+  }
+#else
   [[noreturn]] static void throw_errno(const char* what, const std::string& p,
                                        int e = errno) {
     throw std::system_error(e, std::generic_category(),
                             std::string(what) + " failed for journal " + p);
   }
+#endif
 
   std::uint8_t* base_ = nullptr;
   std::size_t size_ = 0;
+#if defined(_WIN32)
+  HANDLE file_ = INVALID_HANDLE_VALUE;
+  HANDLE mapping_ = nullptr;
+#else
   int fd_ = -1;
+#endif
   bool writable_ = false;
   mutable std::uint64_t cursor_ = 0;
   std::string path_;

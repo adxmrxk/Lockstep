@@ -56,12 +56,11 @@
 #include <string_view>
 
 #include "lockstep/core/clock.hpp"
+#include "lockstep/core/process.hpp"
 #include "lockstep/shm/bus.hpp"
 #include "lockstep/shm/ring.hpp"
 
-#if !defined(_WIN32)
-#include <unistd.h>
-#endif
+
 
 namespace ls {
 
@@ -278,13 +277,7 @@ class publisher {
   ring& get_ring() noexcept { return ring_; }
   std::uint64_t published() const noexcept { return published_; }
 
-  static std::uint32_t current_pid() noexcept {
-#if defined(_WIN32)
-    return 0;
-#else
-    return static_cast<std::uint32_t>(::getpid());
-#endif
-  }
+  static std::uint32_t current_pid() noexcept { return ::ls::self_pid(); }
 
  private:
   bus* bus_ = nullptr;

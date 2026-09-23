@@ -57,7 +57,7 @@ struct sched_report {
 // Ask the kernel for real-time scheduling and locked memory. Returns what
 // actually happened rather than throwing, because the caller usually wants to
 // carry on degraded and say so.
-inline sched_report try_set_realtime(int fifo_priority = 80) noexcept {
+inline sched_report try_set_realtime([[maybe_unused]] int fifo_priority = 80) noexcept {
   sched_report r;
   r.requested_realtime = true;
 #if defined(__linux__)

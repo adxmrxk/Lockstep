@@ -6,17 +6,17 @@
 #include <set>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <vector>
 
 #include "lockstep/shm/arena.hpp"
+#include "lockstep/core/process.hpp"
 #include "lockstep/shm/segment.hpp"
 #include "support/check.hpp"
 
 namespace {
 
 std::string unique_name(const char* tag) {
-  return std::string("lockstep-arena-") + tag + "-" + std::to_string(::getpid());
+  return std::string("lockstep-arena-") + tag + "-" + std::to_string(ls::self_pid());
 }
 
 struct fixture {

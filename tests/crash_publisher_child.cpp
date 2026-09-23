@@ -14,9 +14,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <unistd.h>
 
 #include "lockstep/pubsub.hpp"
+#include "support/process.hpp"
 #include "support/demo_msgs.hpp"
 
 int main(int argc, char** argv) {
@@ -44,7 +44,7 @@ int main(int argc, char** argv) {
 
       // The slot is claimed but not committed for this whole window. A SIGKILL
       // landing here is exactly the case the reaper has to repair.
-      if (hold_us > 0) ::usleep(hold_us);
+      if (hold_us > 0) ls::test::sleep_us(hold_us);
 
       pub.publish(ln);
     }

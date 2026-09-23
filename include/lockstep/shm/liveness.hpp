@@ -12,54 +12,19 @@
 // topic, which for a robot is the same thing as broken. So the bus needs
 // something that notices and repairs.
 //
-// LIVENESS. process_alive() is kill(pid, 0): it asks the kernel whether a pid
-// exists and we may signal it. Two known limits, both stated rather than
-// papered over:
-//
-//   * A zombie -- dead but unreaped by its parent -- still answers yes. On this
-//     bus that is the right answer anyway: a zombie has certainly stopped
-//     publishing, but its pid is not yet reusable, so nothing else can be
-//     confused for it.
-//   * A pid can in principle be recycled onto a different process. The window
-//     is enormous compared to a heartbeat interval, and the heartbeat check
-//     below closes it in practice: a recycled pid will not be updating this
-//     topic's heartbeat.
-//
-// pidfd_open (Linux 5.3+) closes the recycling hole properly by pinning the
-// process rather than its number. It is used when available.
+// Liveness itself lives in core/process.hpp, because the registry needs it too
+// and cannot include this header. Its caveats -- zombies, pid recycling, and
+// what Windows does instead -- are documented there.
 #pragma once
 
-#include <cerrno>
 #include <cstdint>
-#include <csignal>
 
+#include "lockstep/core/process.hpp"
 #include "lockstep/shm/bus.hpp"
 #include "lockstep/shm/registry.hpp"
 #include "lockstep/shm/ring.hpp"
 
-#if defined(__linux__)
-#include <sys/syscall.h>
-#include <unistd.h>
-#endif
-
 namespace ls {
-
-inline bool process_alive(std::uint32_t pid) noexcept {
-  if (pid == 0) return false;
-#if defined(__linux__) && defined(SYS_pidfd_open)
-  // pidfd_open refers to the process, not the number, so it cannot be fooled by
-  // pid recycling. ESRCH means gone; EPERM means alive but not ours.
-  const long fd = ::syscall(SYS_pidfd_open, static_cast<int>(pid), 0u);
-  if (fd >= 0) {
-    ::close(static_cast<int>(fd));
-    return true;
-  }
-  if (errno == ESRCH) return false;
-  if (errno == EPERM) return true;
-  // ENOSYS on an older kernel: fall through to kill(2).
-#endif
-  return ::kill(static_cast<int>(pid), 0) == 0 || errno == EPERM;
-}
 
 // Why a reap pass did or did not act on a topic.
 struct reap_report {
@@ -112,11 +77,35 @@ class reaper {
     return r;
   }
 
-  // A slot whose state is EVEN was claimed and never committed, which can only
-  // mean the publisher died between the two stores. Advancing it to the odd
-  // value would publish whatever half-written bytes are in there, so instead it
-  // is marked abandoned: committed, so readers stop waiting on it, and flagged,
-  // so readers skip it rather than trusting it.
+  // Repair every ticket the dead publisher took but never delivered.
+  //
+  // There are TWO ways a ticket can be left undelivered, and only handling the
+  // obvious one leaves a hole that wedges subscribers permanently:
+  //
+  //   state == 2t  the publisher claimed the slot and died before committing.
+  //                This is the obvious case.
+  //
+  //   state <  2t  the publisher took the ticket from reserve() and died before
+  //                it even stored the claim, so the slot still holds the state
+  //                of an OLDER ticket, capacity publications ago. This one is
+  //                easy to miss: the window is two instructions wide, so on
+  //                Linux it almost never happens. It showed up as soon as the
+  //                same test ran on Windows, where process teardown is slower
+  //                and it reproduced in 2 runs out of 6.
+  //
+  // The second case is the damaging one. A subscriber at cursor t loads a state
+  // word BELOW 2t+1, reads that as "nothing published yet", and waits -- forever,
+  // because the only process that could ever have published t is dead. One such
+  // ticket stalls every subscriber on the topic at that point in the stream.
+  //
+  //   state >  2t  is not damage: the slot has been overwritten by a later
+  //                ticket, which is an ordinary lap, and read() already reports
+  //                it as an overrun. Left alone.
+  //
+  // Neither case may simply be committed as-is: the bytes are either
+  // half-written or belong to another message entirely. They are marked
+  // abandoned instead -- committed so readers stop waiting, flagged so readers
+  // skip them rather than trusting the contents.
   static std::uint32_t heal(ring& rg) noexcept {
     std::uint32_t healed = 0;
     const std::uint64_t wp = rg.write_pos();
@@ -126,7 +115,7 @@ class reaper {
     for (std::uint64_t t = first; t < wp; ++t) {
       ring_slot& s = rg.slot(t);
       std::uint64_t st = s.state.load(std::memory_order_acquire);
-      if (st != 2 * t) continue;  // committed, or reused by a later ticket
+      if (st > 2 * t) continue;  // committed for t, or lapped by a later ticket
 
       s.flags.store(slot_abandoned, std::memory_order_relaxed);
       if (s.state.compare_exchange_strong(st, 2 * t + 1,

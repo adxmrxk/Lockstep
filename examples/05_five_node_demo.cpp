@@ -16,11 +16,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <sys/wait.h>
-#include <unistd.h>
 #include <vector>
 
 #include "demo_msgs.hpp"
+#include "support/process.hpp"
+#include "lockstep/core/process.hpp"
 #include "lockstep/pubsub.hpp"
 #include "lockstep/replay/journal.hpp"
 #include "lockstep/shm/liveness.hpp"
@@ -31,22 +31,12 @@
 
 namespace {
 
-pid_t spawn(const std::string& segment, const char* role, std::uint64_t run_ms,
-            const char* journal = nullptr) {
-  const std::string ms = std::to_string(run_ms);
-  const pid_t pid = ::fork();
-  if (pid == 0) {
-    if (journal != nullptr) {
-      ::execl(LOCKSTEP_DEMO_NODE_BINARY, LOCKSTEP_DEMO_NODE_BINARY, segment.c_str(),
-              role, ms.c_str(), journal, static_cast<char*>(nullptr));
-    } else {
-      ::execl(LOCKSTEP_DEMO_NODE_BINARY, LOCKSTEP_DEMO_NODE_BINARY, segment.c_str(),
-              role, ms.c_str(), static_cast<char*>(nullptr));
-    }
-    std::fprintf(stderr, "exec failed for %s: %s\n", role, std::strerror(errno));
-    ::_exit(127);
-  }
-  return pid;
+ls::test::child_process spawn_node(const std::string& segment, const char* role,
+                                   std::uint64_t run_ms,
+                                   const char* journal = nullptr) {
+  std::vector<std::string> args{segment, role, std::to_string(run_ms)};
+  if (journal != nullptr) args.emplace_back(journal);
+  return ls::test::spawn(LOCKSTEP_DEMO_NODE_BINARY, args);
 }
 
 std::uint64_t replay_logger_journal(const std::string& path) {
@@ -70,8 +60,8 @@ std::uint64_t replay_logger_journal(const std::string& path) {
 }  // namespace
 
 int main() {
-  const std::string segment = "lockstep-demo-" + std::to_string(::getpid());
-  const std::string journal = "/tmp/lockstep-demo-" + std::to_string(::getpid()) + ".jrnl";
+  const std::string segment = "lockstep-demo-" + std::to_string(ls::self_pid());
+  const std::string journal = ls::temp_path("lockstep-demo-") + std::to_string(ls::self_pid()) + ".jrnl";
   constexpr std::uint64_t kRunMs = 3000;
 
   ls::segment::unlink(segment);
@@ -91,28 +81,28 @@ int main() {
               (unsigned long long)b.seg().size());
 
   std::printf("-- starting nodes --\n");
-  std::vector<std::pair<std::string, pid_t>> nodes;
-  nodes.emplace_back("camera", spawn(segment, "camera", kRunMs));
-  nodes.emplace_back("imu", spawn(segment, "imu", kRunMs));
-  ::usleep(150000);  // let the publishers create their topics first
-  pid_t detector = spawn(segment, "detector", kRunMs);
+  std::vector<std::pair<std::string, ls::test::child_process>> nodes;
+  nodes.emplace_back("camera", spawn_node(segment, "camera", kRunMs));
+  nodes.emplace_back("imu", spawn_node(segment, "imu", kRunMs));
+  ls::sleep_us(150000);  // let the publishers create their topics first
+  ls::test::child_process detector = spawn_node(segment, "detector", kRunMs);
   nodes.emplace_back("detector", detector);
-  ::usleep(150000);
-  nodes.emplace_back("fusion", spawn(segment, "fusion", kRunMs));
-  ::usleep(150000);
-  nodes.emplace_back("logger", spawn(segment, "logger", kRunMs, journal.c_str()));
+  ls::sleep_us(150000);
+  nodes.emplace_back("fusion", spawn_node(segment, "fusion", kRunMs));
+  ls::sleep_us(150000);
+  nodes.emplace_back("logger", spawn_node(segment, "logger", kRunMs, journal.c_str()));
 
   for (const auto& n : nodes)
-    std::printf("     %-9s pid %d\n", n.first.c_str(), (int)n.second);
+    std::printf("     %-9s pid %u\n", n.first.c_str(), n.second.pid);
 
   // ---------------------------------------------------------------- crash --
-  ::usleep(1000000);
-  std::printf("\n-- killing the detector with SIGKILL --\n");
-  ::kill(detector, SIGKILL);
-  int st = 0;
-  ::waitpid(detector, &st, 0);
-  std::printf("     detector pid %d killed (signalled=%d)\n", (int)detector,
-              (int)WIFSIGNALED(st));
+  ls::sleep_us(1000000);
+  std::printf("\n-- killing the detector, uncatchably --\n");
+  const std::uint32_t detector_pid = detector.pid;
+  ls::test::kill_hard(detector);
+  ls::test::wait_for(detector);
+  std::printf("     detector pid %u killed; still alive? %s\n", detector_pid,
+              ls::process_alive(detector_pid) ? "yes" : "no");
 
   ls::topic_entry* det_topic = b.topics().find("perception/detections");
   std::printf("     topic publisher_pid before reap: %u\n",
@@ -128,19 +118,16 @@ int main() {
 
   // ------------------------------------------------------------- recovery --
   std::printf("\n-- starting a replacement detector --\n");
-  const pid_t detector2 = spawn(segment, "detector", kRunMs - 1200);
-  std::printf("     detector pid %d took the topic over\n", (int)detector2);
+  ls::test::child_process detector2 = spawn_node(segment, "detector", kRunMs - 1200);
+  std::printf("     detector pid %u took the topic over\n", detector2.pid);
 
   // --------------------------------------------------------------- finish --
   int failures = 0;
   for (auto& n : nodes) {
-    if (n.second == detector) continue;
-    int status = 0;
-    ::waitpid(n.second, &status, 0);
-    if (WIFEXITED(status) && WEXITSTATUS(status) != 0) ++failures;
+    if (n.second.pid == detector_pid) continue;  // already reaped above
+    if (ls::test::wait_for(n.second) != 0) ++failures;
   }
-  int status2 = 0;
-  ::waitpid(detector2, &status2, 0);
+  ls::test::wait_for(detector2);
 
   std::printf("\n-- node summaries (stderr above) --\n");
 
@@ -165,7 +152,7 @@ int main() {
     ++failures;
   }
 
-  ::unlink(journal.c_str());
+  std::remove(journal.c_str());
   std::printf("\n%s\n", failures == 0 ? "demo completed with no failures"
                                       : "demo completed WITH FAILURES");
   return failures == 0 ? 0 : 1;

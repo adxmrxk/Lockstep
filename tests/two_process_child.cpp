@@ -15,6 +15,7 @@
 #include <cstring>
 #include <string_view>
 
+#include "lockstep/core/process.hpp"
 #include "lockstep/shm/bus.hpp"
 #include "support/demo_msgs.hpp"
 
@@ -99,7 +100,7 @@ int main(int argc, char** argv) {
           "pixel offset is self-relative, not absolute");
 
     std::fprintf(stderr, "  [child] base=%p pid=%d checks_failed=%d\n",
-                 b.seg().base(), static_cast<int>(::getpid()), failures);
+                 b.seg().base(), static_cast<int>(ls::self_pid()), failures);
   } catch (const std::exception& ex) {
     std::fprintf(stderr, "  [child] threw: %s\n", ex.what());
     return 1;

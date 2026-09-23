@@ -14,9 +14,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <unistd.h>
 
 #include "demo_msgs.hpp"
+#include "lockstep/core/process.hpp"
 #include "lockstep/pubsub.hpp"
 #include "lockstep/replay/journal.hpp"
 
@@ -47,7 +47,7 @@ int run_camera(ls::bus& b, std::uint64_t run_ms) {
     ln.set_body_size(kFrameBody);
     pub.publish(ln);
     ++seq;
-    ::usleep(10000);  // ~100 Hz
+    ls::sleep_us(10000);  // ~100 Hz
   }
   std::fprintf(stderr, "  [camera]   published %llu frames\n",
                (unsigned long long)seq);
@@ -69,7 +69,7 @@ int run_imu(ls::bus& b, std::uint64_t run_ms) {
     ln->gz = static_cast<float>((seq % 7)) - 3.0f;
     pub.publish(ln);
     ++seq;
-    ::usleep(2000);  // ~500 Hz
+    ls::sleep_us(2000);  // ~500 Hz
   }
   std::fprintf(stderr, "  [imu]      published %llu samples\n",
                (unsigned long long)seq);
@@ -87,7 +87,7 @@ int run_detector(ls::bus& b, std::uint64_t run_ms) {
     ls::sample<DemoFrame> s;
     const auto rr = sub.take(s);
     if (rr == ls::read_result::overrun) { ++lost; continue; }
-    if (rr != ls::read_result::ok) { ::usleep(500); continue; }
+    if (rr != ls::read_result::ok) { ls::sleep_us(500); continue; }
     ++seen;
 
     // "Detection": read some of the frame body, so the node genuinely consumes
@@ -143,7 +143,7 @@ int run_fusion(ls::bus& b, std::uint64_t run_ms) {
       ++poses;
       did = true;
     }
-    if (!did) ::usleep(500);
+    if (!did) ls::sleep_us(500);
   }
   std::fprintf(stderr, "  [fusion]   imu %llu, detections %llu, poses %llu\n",
                (unsigned long long)imus, (unsigned long long)dets,
@@ -163,7 +163,7 @@ int run_logger(ls::bus& b, std::uint64_t run_ms, const char* journal_path) {
   while (!expired(t0, run_ms)) {
     ls::sample<DemoPose> s;
     const auto rr = sub.take(s);
-    if (rr != ls::read_result::ok) { ::usleep(500); continue; }
+    if (rr != ls::read_result::ok) { ls::sleep_us(500); continue; }
 
     DemoPose copy{};
     if (!s.copy_out(copy)) continue;
@@ -201,7 +201,11 @@ int main(int argc, char** argv) {
     if (role == "imu") return run_imu(b, run_ms);
     if (role == "detector") return run_detector(b, run_ms);
     if (role == "fusion") return run_fusion(b, run_ms);
-    if (role == "logger") return run_logger(b, run_ms, argc > 4 ? argv[4] : "/tmp/lockstep-demo.jrnl");
+    if (role == "logger") {
+      const std::string journal =
+          argc > 4 ? std::string(argv[4]) : ls::temp_path("lockstep-demo.jrnl");
+      return run_logger(b, run_ms, journal.c_str());
+    }
     std::fprintf(stderr, "unknown role: %s\n", role.c_str());
     return 2;
   } catch (const std::exception& ex) {

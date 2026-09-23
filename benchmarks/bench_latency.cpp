@@ -23,10 +23,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 #include "demo_msgs.hpp"
+#include "lockstep/core/process.hpp"
 #include "lockstep/pubsub.hpp"
 #include "lockstep/rt/executor.hpp"
 
@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
   // multi-megabyte arena then fails with EAGAIN against a stock RLIMIT_MEMLOCK.
   // Memory setup first, real-time setup second -- which is the correct order for
   // a real-time process anyway.
-  const std::string name = "lockstep-bench-" + std::to_string(::getpid());
+  const std::string name = "lockstep-bench-" + std::to_string(ls::self_pid());
   ls::segment::unlink(name);
   ls::bus b = ls::bus::create(name, {{64, 4096},
                                      {256, 2048},

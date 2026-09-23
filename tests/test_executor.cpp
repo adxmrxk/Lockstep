@@ -13,9 +13,9 @@
 #include <cstdlib>
 #include <new>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
+#include "lockstep/core/process.hpp"
 #include "lockstep/rt/executor.hpp"
 #include "support/check.hpp"
 #include "support/demo_msgs.hpp"
@@ -45,7 +45,7 @@ void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 namespace {
 
 std::string unique_name(const char* tag) {
-  return std::string("lockstep-exec-") + tag + "-" + std::to_string(::getpid());
+  return std::string("lockstep-exec-") + tag + "-" + std::to_string(ls::self_pid());
 }
 
 ls::bus make_bus(const char* tag) {

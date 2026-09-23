@@ -6,8 +6,8 @@
 // offsets would differ.
 #include <cstdint>
 #include <string>
-#include <unistd.h>
 
+#include "lockstep/core/process.hpp"
 #include "lockstep/pubsub.hpp"
 #include "support/check.hpp"
 #include "support/demo_msgs.hpp"
@@ -15,7 +15,7 @@
 namespace {
 
 std::string unique_name(const char* tag) {
-  return std::string("lockstep-ps-") + tag + "-" + std::to_string(::getpid());
+  return std::string("lockstep-ps-") + tag + "-" + std::to_string(ls::self_pid());
 }
 
 ls::bus make_bus(const char* tag) {

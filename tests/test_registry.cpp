@@ -4,10 +4,10 @@
 #include <cstdint>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <vector>
 
 #include "lockstep/shm/registry.hpp"
+#include "lockstep/core/process.hpp"
 #include "lockstep/shm/segment.hpp"
 #include "support/check.hpp"
 #include "support/demo_msgs.hpp"
@@ -15,7 +15,7 @@
 namespace {
 
 std::string unique_name(const char* tag) {
-  return std::string("lockstep-reg-") + tag + "-" + std::to_string(::getpid());
+  return std::string("lockstep-reg-") + tag + "-" + std::to_string(ls::self_pid());
 }
 
 struct fixture {

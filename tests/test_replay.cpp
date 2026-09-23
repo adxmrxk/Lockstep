@@ -13,9 +13,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
+#include "lockstep/core/process.hpp"
 #include "lockstep/pubsub.hpp"
 #include "lockstep/replay/journal.hpp"
 #include "support/check.hpp"
@@ -27,11 +27,11 @@ constexpr int kMessages = 200;
 constexpr int kReplays = 1000;
 
 std::string tmp_path(const char* tag) {
-  return std::string("/tmp/lockstep-") + tag + "-" + std::to_string(::getpid()) + ".jrnl";
+  return std::string(ls::temp_path("lockstep-")) + tag + "-" + std::to_string(ls::self_pid()) + ".jrnl";
 }
 
 std::string unique_name(const char* tag) {
-  return std::string("lockstep-replay-") + tag + "-" + std::to_string(::getpid());
+  return std::string("lockstep-replay-") + tag + "-" + std::to_string(ls::self_pid());
 }
 
 // The node under test. Its output depends on the message AND on what the clock
@@ -172,7 +172,7 @@ void a_journal_round_trips() {
   LS_CHECK_EQ(r.value, 123456u);
 
   LS_CHECK(!j.next(r));
-  ::unlink(path.c_str());
+  std::remove(path.c_str());
 }
 
 void a_full_journal_refuses_rather_than_overruns() {
@@ -184,7 +184,7 @@ void a_full_journal_refuses_rather_than_overruns() {
   LS_CHECK(written > 0);
   LS_CHECK(!j.append(ls::record_kind::message, 0, 0, 0, blob, sizeof(blob)));
   LS_CHECK(j.used() <= 4096u);
-  ::unlink(path.c_str());
+  std::remove(path.c_str());
 }
 
 // THE test.
@@ -238,7 +238,7 @@ void a_thousand_replays_all_match() {
   LS_CHECK(live.hash != rec.hash);
   LS_CHECK_EQ(live.delivered, rec.delivered);  // same inputs, different result
 
-  ::unlink(path.c_str());
+  std::remove(path.c_str());
 }
 
 // Two recordings of the same journal must hash identically; a journal with one
@@ -268,8 +268,8 @@ void the_journal_hash_detects_a_changed_byte() {
     }
     LS_CHECK(j.content_hash() != original);
   }
-  ::unlink(path.c_str());
-  ::unlink((path + ".v2").c_str());
+  std::remove(path.c_str());
+  std::remove((path + ".v2").c_str());
 }
 
 }  // namespace

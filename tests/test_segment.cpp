@@ -3,15 +3,15 @@
 #include <cstring>
 #include <string>
 #include <system_error>
-#include <unistd.h>
 
+#include "lockstep/core/process.hpp"
 #include "lockstep/shm/segment.hpp"
 #include "support/check.hpp"
 
 namespace {
 
 std::string unique_name(const char* tag) {
-  return std::string("lockstep-test-") + tag + "-" + std::to_string(::getpid());
+  return std::string("lockstep-test-") + tag + "-" + std::to_string(ls::self_pid());
 }
 
 void create_map_and_unlink() {

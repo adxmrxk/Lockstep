@@ -33,18 +33,20 @@ foreach(t IN LISTS LOCKSTEP_COMPILE_FAIL_TESTS)
 endforeach()
 
 # ---------------------------------------------------------------------------
-# Phase 2: shared memory. POSIX only for now -- the Win32 CreateFileMapping
-# backend is not written, so these targets are skipped on Windows rather than
-# failing the build there.
+# Phase 2 onwards: shared memory. Built on both platforms -- POSIX shm_open and
+# Win32 CreateFileMapping -- including the multi-process tests, which are the
+# ones that actually prove the transport works.
 # ---------------------------------------------------------------------------
-if(UNIX)
+if(UNIX OR WIN32)
   find_package(Threads REQUIRED)
 
-  # shm_open lives in librt on glibc older than 2.34, and in libc after it.
-  find_library(LOCKSTEP_RT_LIB rt)
   set(LOCKSTEP_SHM_LIBS lockstep::lockstep Threads::Threads)
-  if(LOCKSTEP_RT_LIB)
-    list(APPEND LOCKSTEP_SHM_LIBS ${LOCKSTEP_RT_LIB})
+  if(UNIX)
+    # shm_open lives in librt on glibc older than 2.34, and in libc after it.
+    find_library(LOCKSTEP_RT_LIB rt)
+    if(LOCKSTEP_RT_LIB)
+      list(APPEND LOCKSTEP_SHM_LIBS ${LOCKSTEP_RT_LIB})
+    endif()
   endif()
 
   set(LOCKSTEP_SHM_TESTS

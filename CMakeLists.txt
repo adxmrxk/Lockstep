@@ -23,7 +23,13 @@ if(MSVC)
   # /Zc:preprocessor -- LOCKSTEP_MESSAGE relies on conformant __VA_ARGS__
   #                     expansion, which the legacy MSVC preprocessor breaks.
   # /permissive-     -- two-phase lookup, required for the trait templates.
-  target_compile_options(lockstep INTERFACE /Zc:preprocessor /permissive- /W4)
+  # /wd5105 -- the Windows SDK's own winbase.h produces "macro expansion
+  #            producing 'defined' has undefined behavior" when compiled with
+  #            /Zc:preprocessor, which LOCKSTEP_MESSAGE requires. It is the
+  #            SDK's defect, not this project's, and there is no way to fix it
+  #            from here short of giving up conformant __VA_ARGS__ expansion.
+  #            Scoped to this warning only, so our own code stays /W4-clean.
+  target_compile_options(lockstep INTERFACE /Zc:preprocessor /permissive- /W4 /wd5105)
 else()
   target_compile_options(lockstep INTERFACE -Wall -Wextra -Wpedantic)
 endif()
