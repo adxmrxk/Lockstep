@@ -1,0 +1,186 @@
+name: CI
+
+# Everything this project claims should be checked by a machine, not by me
+# remembering to run it. Three bugs in this repo shipped through a green local
+# suite and only fell out under repetition or a sanitizer, so the jobs below run
+# the sanitizers and the repetition every time rather than when someone thinks
+# of it.
+#
+# The matrix is also how Clang gets covered at all: there is no Clang on the
+# development machine and installing one needs root, which a CI runner has and
+# a laptop being borrowed for an afternoon does not.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.cc }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cc: gcc
+            cxx: g++
+          - cc: clang
+            cxx: clang++
+    steps:
+      - uses: actions/checkout@v4
+
+      # NOTE: the Clang leg has never run anywhere. There is no Clang on the
+      # development machine and no root to install one, so the first CI run is
+      # genuinely the first time this code meets that compiler. If something
+      # goes red here first time, that is this job working, not this job being
+      # broken. The likeliest candidate is test_provenance: offset_ptr defeats
+      # the optimizer with asm barriers chosen against GCC and MSVC, and Clang
+      # may need a different hammer or none at all.
+      - name: Compiler version
+        run: ${{ matrix.cxx }} --version
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_COMPILER=${{ matrix.cc }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure
+
+      # Three of this project's bugs only appeared on repetition: a registry
+      # race that reproduced 4 times in 60, and a reaper hole that reproduced
+      # 2 in 6. One green run does not mean much here.
+      - name: Repeat the suite (flakiness)
+        working-directory: build
+        run: |
+          for i in $(seq 1 5); do
+            ctest --output-on-failure || exit 1
+          done
+
+  windows:
+    name: Windows MSVC
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      # CMake locates Visual Studio itself, so this needs no third-party action
+      # and no vcvars dance. The VS generator is multi-config, hence the
+      # --config and -C flags below.
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config RelWithDebInfo
+
+      # The Win32 backend and the CreateProcess-based multi-process tests are
+      # the whole reason this job exists; a build-only check would not have
+      # caught the reaper hole that Windows timing exposed.
+      - name: Test
+        working-directory: build
+        run: ctest -C RelWithDebInfo --output-on-failure
+
+      - name: Repeat the crash test
+        working-directory: build
+        shell: bash
+        run: |
+          for i in $(seq 1 5); do
+            ./tests/RelWithDebInfo/test_crash_consistency.exe || exit 1
+          done
+
+  sanitizers:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ThreadSanitizer
+            flags: '-fsanitize=thread -g -O1'
+          - name: Address+UB
+            flags: '-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_FLAGS="${{ matrix.flags }}"
+          -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.flags }}"
+
+      - name: Build
+        run: cmake --build build -j
+
+      # halt_on_error makes a race a build failure rather than a warning buried
+      # in the log. Without it TSan prints and carries on, and the job goes
+      # green with races in it.
+      - name: Test
+        working-directory: build
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --output-on-failure
+
+  model-check:
+    name: TLA+ model check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # Checks BOTH outcomes: the single-publisher model must verify, and the
+      # multi-publisher one must still reproduce its torn read. A "fix" that
+      # silently made the counterexample stop reproducing would be a regression
+      # in the model, and this catches it.
+      - name: Run TLC
+        run: bash scripts/model-check.sh
+
+  relacy:
+    name: Relacy memory-model check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Asserts BOTH outcomes: release/acquire must verify, and the relaxed
+      # control must still be caught. A model that stopped detecting the
+      # deliberately-broken build would be silently useless.
+      - name: Run Relacy
+        run: bash scripts/relacy-check.sh
+
+  crash-soak:
+    name: 10k crash injections
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build -j
+
+      # The roadmap's phase 5 number. Kept out of the default suite because it
+      # takes ~20s and the suite should stay under a second, but it runs here on
+      # every push so the claim cannot quietly stop being true.
+      - name: SIGKILL soak
+        working-directory: build
+        env:
+          LOCKSTEP_CRASH_ITERS: '10000'
+        run: ./tests/test_crash_consistency
