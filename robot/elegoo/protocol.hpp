@@ -45,7 +45,6 @@ struct profile {
   int cmd_ultrasonic = 21;  // range query
   int cmd_line_track = 22;  // IR line sensors
   int cmd_stop = 100;       // all stop
-  int cmd_heartbeat = 110;  // keeps the firmware's failsafe from cutting out
 
   // For cmd_motor: which D1 selects which side.
   int motor_left = 1;
@@ -64,12 +63,35 @@ struct profile {
   int speed_max = 255;
   int speed_deadband = 80;
 
-  // The firmware stops the car if it hears nothing for roughly 500 ms. The
-  // bridge sends a heartbeat well inside that.
-  int heartbeat_interval_ms = 200;
 };
 
 inline constexpr profile default_profile{};
+
+// The handshake tag, the "H" field.
+//
+// VERIFIED AGAINST HARDWARE, and it is not optional. A sensor query sent
+// without "H" is discarded by the firmware in silence -- no reply, no error,
+// no hint that anything was wrong. The same query carrying it answers at once:
+//
+//   -> {"N":21,"D1":2}            (nothing, ever)
+//   -> {"H":"ls","N":21,"D1":2}   <- {ls_52}
+//
+// The car echoes the tag back as {<tag>_<payload>}, which is how a reply is
+// matched to the request that caused it. Keep it non-numeric, or parse_reply
+// cannot tell the tag from the value.
+inline constexpr const char* handshake_tag = "ls";
+
+// The keepalive. Not a numbered command -- a bare frame, spelled exactly this
+// way.
+//
+// The ESP32 sends it every 1000 ms and expects the identical string back.
+// Three unanswered in a row and it tears the TCP session down, so a node that
+// ignores heartbeats dies about three seconds into any run.
+inline constexpr const char* heartbeat_frame = "{Heartbeat}";
+
+inline bool is_heartbeat(std::string_view frame) {
+  return frame.find("Heartbeat") != std::string_view::npos;
+}
 
 // ---------------------------------------------------------------------------
 // Encoding. Pure functions of their inputs, so they are unit-testable with no
@@ -92,7 +114,10 @@ inline int apply_deadband(int v, const profile& p) {
   return v;
 }
 
-inline std::string json_begin(int n) { return "{\"N\":" + std::to_string(n); }
+inline std::string json_begin(int n) {
+  return "{\"H\":\"" + std::string(handshake_tag) + "\",\"N\":" +
+         std::to_string(n);
+}
 
 inline std::string field(const char* key, int value) {
   return ",\"" + std::string(key) + "\":" + std::to_string(value);
@@ -136,8 +161,9 @@ inline std::string encode_stop(const profile& p = default_profile) {
   return json_begin(p.cmd_stop) + "}";
 }
 
-inline std::string encode_heartbeat(const profile& p = default_profile) {
-  return json_begin(p.cmd_heartbeat) + "}";
+// Echoed verbatim rather than encoded, because the keepalive is not a command.
+inline std::string encode_heartbeat(const profile& = default_profile) {
+  return std::string(heartbeat_frame);
 }
 
 inline std::string encode_ultrasonic(const profile& p = default_profile) {
@@ -175,27 +201,42 @@ inline reply parse_reply(std::string_view line) {
   reply r;
   r.raw.assign(line.begin(), line.end());
 
-  // Strip the braces and whitespace the firmware sprinkles around replies.
+  // Strip the braces and whitespace the firmware sprinkles around replies, but
+  // KEEP the underscore: it is what separates the echoed tag from the payload.
   std::string t;
   t.reserve(line.size());
   for (const char c : line) {
-    if (c == '{' || c == '}' || c == '_' || c == '\r' || c == '\n') continue;
+    if (c == '{' || c == '}' || c == '\r' || c == '\n' || c == ' ') continue;
     t.push_back(c);
   }
 
-  // First integer, if any. A leading '-' counts.
-  for (std::size_t i = 0; i < t.size(); ++i) {
-    if ((t[i] >= '0' && t[i] <= '9') ||
-        (t[i] == '-' && i + 1 < t.size() && t[i + 1] >= '0' && t[i + 1] <= '9')) {
-      r.value = std::strtol(t.c_str() + i, nullptr, 10);
+  // A tagged reply is {<tag>_<payload>}, so the payload is the last non-empty
+  // underscore-separated field. Scanning for the FIRST integer instead would
+  // read the digits out of a tag like "ls2" and report them as a distance.
+  std::string payload = t;
+  std::size_t end = t.size();
+  while (end > 0) {
+    const std::size_t sep = t.find_last_of('_', end - 1);
+    if (sep == std::string::npos) { payload = t.substr(0, end); break; }
+    if (sep + 1 < end) { payload = t.substr(sep + 1, end - sep - 1); break; }
+    end = sep;  // a trailing underscore, as in _137_
+  }
+  if (end == 0) payload.clear();
+
+  // The payload as an integer, if it is one. A leading '-' counts.
+  for (std::size_t i = 0; i < payload.size(); ++i) {
+    if ((payload[i] >= '0' && payload[i] <= '9') ||
+        (payload[i] == '-' && i + 1 < payload.size() &&
+         payload[i + 1] >= '0' && payload[i + 1] <= '9')) {
+      r.value = std::strtol(payload.c_str() + i, nullptr, 10);
       r.has_value = true;
       break;
     }
   }
 
   // Affirmative if it says so, or if it is a bare number (a sensor answering).
-  auto contains = [&t](const char* needle) {
-    return t.find(needle) != std::string::npos;
+  auto contains = [&payload](const char* needle) {
+    return payload.find(needle) != std::string::npos;
   };
   if (contains("ok") || contains("OK") || contains("true") || contains("TRUE")) {
     r.affirmative = true;

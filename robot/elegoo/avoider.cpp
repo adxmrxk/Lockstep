@@ -82,7 +82,20 @@ struct options {
   std::string journal;
   std::string replay;
   long duration_ms = 0;
+  bool trace = false;
 };
+
+// Why decide() returned what it did, for the trace.
+//
+// Derived from the same two values decide() branches on rather than reported by
+// decide() itself, so the label cannot drift away from the behaviour it claims
+// to describe without the thresholds above changing too.
+const char* reason_for(const RobotRange& r) {
+  if (r.valid == 0) return "NO READING -- creeping blind";
+  if (r.distance_cm < kStopDistanceCm) return "obstacle -- reverse and spin";
+  if (r.distance_cm < kSlowDistanceCm) return "closing -- slow down";
+  return "clear -- cruise";
+}
 
 void usage() {
   std::printf(
@@ -90,29 +103,59 @@ void usage() {
       "  --bus <name>      segment to attach to (default lockstep-robot)\n"
       "  --journal <path>  record the session for later replay\n"
       "  --replay <path>   replay a recorded session and print its hash\n"
+      "  --trace           with --replay, print every decision as it is\n"
+      "                    re-executed: what was seen, when, what was done\n"
       "  --duration <ms>   run time; 0 means until the bridge stops\n");
 }
 
 // Replay: no bus, no robot, no clock. Every input comes from the journal.
-int run_replay(const std::string& path) {
+//
+// NOTHING MOVES during a replay. The car can be switched off, boxed, or on the
+// other side of the country. This re-executes the DECISIONS on this machine
+// from the recording; it does not re-drive the robot.
+int run_replay(const std::string& path, bool trace) {
   ls::journal j = ls::journal::open_read(path);
   ls::deterministic_clock clk(ls::run_mode::replay, &j);
   ls::output_hasher out;
 
   std::uint32_t seq = 0;
   std::uint64_t decisions = 0;
+  std::uint64_t t0 = 0;
+  bool have_t0 = false;
   ls::record rec;
+
+  if (trace) {
+    std::printf("\n  %4s %9s %9s %6s %6s %7s  %s\n", "#", "TIME", "RANGE",
+                "VALID", "LEFT", "RIGHT", "WHY");
+    std::printf("  %4s %9s %9s %6s %6s %7s  %s\n", "----", "--------",
+                "--------", "-----", "-----", "-----", "---");
+  }
+
   while (j.next(rec)) {
     if (rec.kind != ls::record_kind::message) continue;
     RobotRange r{};
     std::memcpy(&r, rec.payload, sizeof(r));
 
     // The clock read happens INSIDE decide() in the recorded run too, so the
-    // journal's clock record lands in the same place in the stream.
-    const RobotDrive d = decide(r, clk.now_ns(), seq++);
+    // journal's clock record lands in the same place in the stream. Hoisting it
+    // out changes nothing: it is still exactly one read, in the same position.
+    const std::uint64_t now = clk.now_ns();
+    const RobotDrive d = decide(r, now, seq++);
     out.mix_value(d.left);
     out.mix_value(d.right);
     ++decisions;
+
+    if (trace) {
+      if (!have_t0) { t0 = now; have_t0 = true; }
+      char range_s[32];
+      if (r.valid != 0) std::snprintf(range_s, sizeof range_s, "%.0f cm",
+                                      static_cast<double>(r.distance_cm));
+      else std::snprintf(range_s, sizeof range_s, "--");
+      std::printf("  %4llu %8.3fs %9s %6s %6d %7d  %s\n",
+                  static_cast<unsigned long long>(decisions - 1),
+                  static_cast<double>(now - t0) / 1e9, range_s,
+                  r.valid != 0 ? "yes" : "NO", d.left, d.right, reason_for(r));
+    }
   }
 
   std::printf("  [replay] %llu decisions from %llu records\n",
@@ -131,6 +174,7 @@ int main(int argc, char** argv) {
     const std::string a = argv[i];
     auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : nullptr; };
     if (a == "--help" || a == "-h") { usage(); return 0; }
+    else if (a == "--trace") { opt.trace = true; }
     else if (a == "--bus") { const char* v = next(); if (!v) return 1; opt.bus = v; }
     else if (a == "--journal") { const char* v = next(); if (!v) return 1; opt.journal = v; }
     else if (a == "--replay") { const char* v = next(); if (!v) return 1; opt.replay = v; }
@@ -139,7 +183,7 @@ int main(int argc, char** argv) {
     else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(); return 1; }
   }
 
-  if (!opt.replay.empty()) return run_replay(opt.replay);
+  if (!opt.replay.empty()) return run_replay(opt.replay, opt.trace);
 
   std::printf("avoider\n=======\n");
 

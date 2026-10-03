@@ -57,10 +57,15 @@ struct options {
   bool attach = false;   // join an existing bus instead of creating one
   bool sim = false;
   bool probe = false;
-  int rate_hz = 20;
+  // 4 Hz, not 20. A measured ultrasonic round trip on this car is ~250 ms
+  // (query out, {ls_52} back), so a 50 ms loop cannot work: the reply for one
+  // cycle would not arrive until four cycles later. 20 Hz was wishful.
+  int rate_hz = 4;
   long duration_ms = 0;  // 0 = until interrupted
   int connect_timeout_ms = 3000;
-  int reply_timeout_ms = 250;
+  // Measured replies land at 238-255 ms, so the old 250 ms budget sat exactly
+  // on the threshold and dropped readings at random.
+  int reply_timeout_ms = 1000;
 };
 
 void usage() {
@@ -70,7 +75,8 @@ void usage() {
       "  --port <n>         robot TCP port (default 100)\n"
       "  --bus <name>       segment name (default lockstep-robot)\n"
       "  --attach           join an existing bus instead of creating it\n"
-      "  --rate <hz>        sensor poll rate (default 20)\n"
+      "  --rate <hz>        sensor poll rate (default 4; the car answers in\n"
+      "                     ~250ms, so much above 4 Hz is not achievable)\n"
       "  --duration <ms>    run time; 0 or omitted means until Ctrl-C\n"
       "  --sim              no robot: synthesise sensors, absorb drive commands\n"
       "  --probe            send each command once, print raw replies, exit\n");
@@ -147,22 +153,59 @@ class robot_link {
     ++sent_;
     if (opt_.sim) return simulate(cmd);
 
-    if (!stream_.valid() || !stream_.send_all(cmd + "\n")) {
+    // No trailing newline: the firmware frames on braces and a newline is
+    // simply junk between frames.
+    if (!stream_.valid() || !stream_.send_all(cmd)) {
       ++errors_;
       connected_ = false;
       return {};
     }
-    if (!expect_reply) { ++ok_; return {true, false, 0, ""}; }
-
-    std::string line;
-    if (!stream_.recv_until('\n', line, opt_.reply_timeout_ms)) {
-      // A missed reply is not fatal on its own -- the firmware drops replies
-      // under load -- but a run of them means the link is gone.
-      ++errors_;
-      return {};
+    if (!expect_reply) {
+      ++ok_;
+      service_heartbeat();
+      return {true, false, 0, ""};
     }
-    ++ok_;
-    return ls::elegoo::parse_reply(line);
+
+    // The car's 1 Hz {Heartbeat} shares this socket with command replies, so
+    // read until a frame arrives that is not one. Handing a heartbeat to
+    // parse_reply would be worse than losing the reply: it parses as
+    // affirmative-with-no-value, the caller books it as the answer, and every
+    // later reply is then matched to the wrong request.
+    const std::uint64_t t0 = ls::now_ns();
+    for (;;) {
+      const long spent = static_cast<long>((ls::now_ns() - t0) / 1000000u);
+      const int left = opt_.reply_timeout_ms - static_cast<int>(spent);
+      if (left <= 0) break;
+      std::string frame;
+      if (!stream_.recv_frame(frame, left)) break;
+      if (ls::elegoo::is_heartbeat(frame)) { answer_heartbeat(); continue; }
+      ++ok_;
+      return ls::elegoo::parse_reply(frame);
+    }
+    // A missed reply is not fatal on its own -- the firmware drops replies
+    // under load -- but a run of them means the link is gone.
+    ++errors_;
+    return {};
+  }
+
+  // Answer whatever keepalive is already waiting, without blocking.
+  //
+  // This cannot live only in the reply path. The ESP32 drops the session after
+  // three unanswered heartbeats, so an iteration that happened to send nothing
+  // still has to service the socket or the link dies on an idle robot.
+  void service_heartbeat() {
+    if (opt_.sim) return;
+    std::string frame;
+    while (stream_.valid() && stream_.recv_frame(frame, 1)) {
+      if (ls::elegoo::is_heartbeat(frame)) answer_heartbeat();
+    }
+  }
+
+  void answer_heartbeat() {
+    if (!stream_.send_all(ls::elegoo::heartbeat_frame)) {
+      connected_ = false;
+      ++errors_;
+    }
   }
 
  private:
@@ -195,7 +238,7 @@ int run_probe(robot_link& l) {
   const ls::elegoo::profile& p = ls::elegoo::default_profile;
   struct probe_item { const char* what; std::string cmd; bool reply; };
   const probe_item items[] = {
-      {"heartbeat", ls::elegoo::encode_heartbeat(p), true},
+      {"heartbeat (keepalive)", ls::elegoo::encode_heartbeat(p), false},
       {"ultrasonic", ls::elegoo::encode_ultrasonic(p), true},
       {"line track", ls::elegoo::encode_line_track(p), true},
       {"stop", ls::elegoo::encode_stop(p), true},
@@ -205,19 +248,28 @@ int run_probe(robot_link& l) {
       {"stop", ls::elegoo::encode_stop(p), true},
   };
 
-  std::printf("\n  %-18s %-34s %s\n", "COMMAND", "SENT", "RAW REPLY");
-  std::printf("  %-18s %-34s %s\n", "-------", "----", "---------");
+  std::printf("\n  %-22s %-40s %s\n", "COMMAND", "SENT", "RAW REPLY");
+  std::printf("  %-22s %-40s %s\n", "-------", "----", "---------");
   for (const auto& it : items) {
     const ls::elegoo::reply r = l.exchange(it.cmd, it.reply);
-    std::printf("  %-18s %-34s %s\n", it.what, it.cmd.c_str(),
-                r.raw.empty() ? "(no reply / timeout)" : r.raw.c_str());
+    // Silence on the keepalive is correct, not a fault: it is the thing we
+    // send BACK, so reporting it as a timeout reads like a broken car.
+    const char* shown =
+        !r.raw.empty() ? r.raw.c_str()
+                       : (it.reply ? "(no reply / timeout)"
+                                   : "(keepalive -- none expected)");
+    std::printf("  %-22s %-40s %s\n", it.what, it.cmd.c_str(), shown);
     ls::sleep_us(300000);
   }
 
   std::printf(
       "\n  If a reply is empty or nonsense, the command number in\n"
       "  robot/elegoo/protocol.hpp does not match your firmware. Edit the\n"
-      "  `profile` struct there -- nothing else needs to change.\n");
+      "  `profile` struct there -- nothing else needs to change.\n"
+      "\n  If EVERY row is empty but the link connected, check the slide switch\n"
+      "  on the shield: it has to be in the camera/ESP32 position, not the\n"
+      "  upload position, or the ESP32 is cut off from the Arduino and the\n"
+      "  WiFi side works perfectly while nothing reaches the motors.\n");
   return 0;
 }
 
@@ -279,7 +331,6 @@ int main(int argc, char** argv) {
 
   const unsigned period_us = static_cast<unsigned>(1000000 / opt.rate_hz);
   const std::uint64_t t0 = ls::now_ns();
-  std::uint64_t last_heartbeat = t0;
 
   // Somebody has to run the reaper, and in a real deployment it had better be a
   // process that outlives the nodes it is reclaiming for. The bridge owns the
@@ -353,19 +404,26 @@ int main(int argc, char** argv) {
         }
       }
       if (got) {
-        l.exchange(ls::elegoo::encode_left(latest.left), false);
-        l.exchange(ls::elegoo::encode_right(latest.right), false);
+        // Wait for each acknowledgement rather than firing and forgetting.
+        //
+        // These DO answer -- {ls_ok}, about 250ms later. Sending them without
+        // collecting the reply leaves it sitting in the socket, and the next
+        // cycle's range read picks up that stale {ls_ok} instead of its own
+        // {ls_44}: no number in it, so the reading is marked invalid, and from
+        // then on every reply is matched to the request before it. A correct
+        // 1.3 Hz beats a 4 Hz that is reading one cycle behind reality.
+        l.exchange(ls::elegoo::encode_left(latest.left), true);
+        l.exchange(ls::elegoo::encode_right(latest.right), true);
         ++commands_forwarded;
       }
     }
 
-    // ---- keep the firmware failsafe quiet ----
+    // ---- keep the session alive ----
+    // The car drives this, not us: it sends {Heartbeat} every second and hangs
+    // up after three unanswered. exchange() answers them inline, but an
+    // iteration that sent nothing still has to drain the socket.
     const std::uint64_t now = ls::now_ns();
-    if ((now - last_heartbeat) / 1000000u >=
-        static_cast<std::uint64_t>(ls::elegoo::default_profile.heartbeat_interval_ms)) {
-      l.exchange(ls::elegoo::encode_heartbeat(), false);
-      last_heartbeat = now;
-    }
+    l.service_heartbeat();
 
     // ---- reclaim anything that died ----
     if ((now - last_reap) / 1000000u >= kReapIntervalMs) {

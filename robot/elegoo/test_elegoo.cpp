@@ -31,14 +31,38 @@ using namespace ls::elegoo;
 // ---------------------------------------------------------------------------
 
 void commands_encode_exactly() {
-  LS_CHECK(encode_stop() == std::string("{\"N\":100}"));
-  LS_CHECK(encode_heartbeat() == std::string("{\"N\":110}"));
-  LS_CHECK(encode_ultrasonic() == std::string("{\"N\":21,\"D1\":2}"));
+  LS_CHECK(encode_stop() == std::string("{\"H\":\"ls\",\"N\":100}"));
+  LS_CHECK(encode_ultrasonic() ==
+           std::string("{\"H\":\"ls\",\"N\":21,\"D1\":2}"));
   LS_CHECK(encode_move(direction::forward, 150) ==
-           std::string("{\"N\":3,\"D1\":3,\"D2\":150}"));
+           std::string("{\"H\":\"ls\",\"N\":3,\"D1\":3,\"D2\":150}"));
   LS_CHECK(encode_move(direction::back, 150) ==
-           std::string("{\"N\":3,\"D1\":4,\"D2\":150}"));
-  LS_CHECK(encode_servo(90) == std::string("{\"N\":5,\"D1\":1,\"D2\":90}"));
+           std::string("{\"H\":\"ls\",\"N\":3,\"D1\":4,\"D2\":150}"));
+  LS_CHECK(encode_servo(90) ==
+           std::string("{\"H\":\"ls\",\"N\":5,\"D1\":1,\"D2\":90}"));
+}
+
+// The "H" tag is not decoration. A query without it is discarded by the
+// firmware in silence -- that one missing field is why the bridge talked to a
+// working car for an entire session and received nothing back.
+void every_command_carries_the_handshake_tag() {
+  LS_CHECK(encode_stop().find("\"H\":\"ls\"") != std::string::npos);
+  LS_CHECK(encode_ultrasonic().find("\"H\":\"ls\"") != std::string::npos);
+  LS_CHECK(encode_line_track().find("\"H\":\"ls\"") != std::string::npos);
+  LS_CHECK(encode_left(150).find("\"H\":\"ls\"") != std::string::npos);
+  LS_CHECK(encode_right(150).find("\"H\":\"ls\"") != std::string::npos);
+  LS_CHECK(encode_move(direction::forward, 150).find("\"H\":\"ls\"") !=
+           std::string::npos);
+  LS_CHECK(encode_servo(90).find("\"H\":\"ls\"") != std::string::npos);
+}
+
+// The keepalive is a bare frame, not a numbered command, and the ESP32 hangs up
+// after three unanswered ones.
+void the_keepalive_is_a_bare_frame() {
+  LS_CHECK(encode_heartbeat() == std::string("{Heartbeat}"));
+  LS_CHECK(is_heartbeat("{Heartbeat}"));
+  LS_CHECK(!is_heartbeat("{ls_52}"));
+  LS_CHECK(!is_heartbeat("{ok}"));
 }
 
 // Reverse is a sign on the speed, encoded as a direction field plus magnitude.
@@ -47,8 +71,8 @@ void commands_encode_exactly() {
 void reverse_is_encoded_as_direction_zero() {
   const std::string fwd = encode_left(150);
   const std::string rev = encode_left(-150);
-  LS_CHECK(fwd == std::string("{\"N\":1,\"D1\":1,\"D2\":150,\"D3\":1}"));
-  LS_CHECK(rev == std::string("{\"N\":1,\"D1\":1,\"D2\":150,\"D3\":0}"));
+  LS_CHECK(fwd == std::string("{\"H\":\"ls\",\"N\":1,\"D1\":1,\"D2\":150,\"D3\":1}"));
+  LS_CHECK(rev == std::string("{\"H\":\"ls\",\"N\":1,\"D1\":1,\"D2\":150,\"D3\":0}"));
   LS_CHECK(fwd != rev);
 }
 
@@ -107,6 +131,26 @@ void replies_parse() {
   const reply crlf = parse_reply("{99}\r\n");
   LS_CHECK_EQ(crlf.value, 99L);
 
+  // The shape the real car actually answers with: {<tag>_<payload>}.
+  const reply tagged = parse_reply("{ls_52}");
+  LS_CHECK(tagged.has_value);
+  LS_CHECK_EQ(tagged.value, 52L);
+  LS_CHECK(tagged.affirmative);
+
+  const reply tagged_ok = parse_reply("{ls_ok}");
+  LS_CHECK(tagged_ok.affirmative);
+  LS_CHECK(!tagged_ok.has_value);
+
+  const reply tagged_false = parse_reply("{ls_false}");
+  LS_CHECK(!tagged_false.affirmative);
+
+  // The payload is the LAST underscore-separated field, not the first integer
+  // in the string. A tag with a digit in it would otherwise be read as the
+  // distance, and the car would brake at a number that came from its own tag.
+  const reply digit_tag = parse_reply("{ls2_52}");
+  LS_CHECK(digit_tag.has_value);
+  LS_CHECK_EQ(digit_tag.value, 52L);
+
   const reply empty = parse_reply("");
   LS_CHECK(!empty.affirmative);
   LS_CHECK(!empty.has_value);
@@ -132,8 +176,9 @@ void implausible_ranges_are_rejected() {
 // The socket layer, against a fake robot.
 // ---------------------------------------------------------------------------
 
-// Speaks just enough Elegoo to exercise the bridge's link handling: newline
-// framed, answers range queries with a number, everything else with {ok}.
+// Speaks just enough Elegoo to exercise the bridge's link handling: brace
+// framed with NO trailing newline, exactly like the real firmware, answering
+// range queries with a tagged number and everything else with {ok}.
 struct fake_robot {
   ls::net::tcp_listener listener;
   std::thread thread;
@@ -148,12 +193,12 @@ struct fake_robot {
       ls::net::tcp_stream c = listener.accept(3000);
       if (!c.valid()) return;
       std::string line;
-      while (running.load() && c.recv_until('\n', line, 1000)) {
+      while (running.load() && c.recv_frame(line, 1000)) {
         commands_seen.fetch_add(1);
         const std::string resp =
             line.find("\"N\":21") != std::string::npos
-                ? "{" + std::to_string(range_to_report) + "}\n"
-                : std::string("{ok}\n");
+                ? "{ls_" + std::to_string(range_to_report) + "}"
+                : std::string("{ok}");
         if (!c.send_all(resp)) break;
       }
     });
@@ -183,17 +228,19 @@ void the_link_talks_to_a_fake_robot() {
   }
 
   // A range query round-trips and parses to the value the robot reported.
-  LS_CHECK(c.send_all(encode_ultrasonic() + "\n"));
+  // Sent with no trailing newline, and read back by brace framing -- waiting
+  // for a '\n' here is what made a correct reply look like a timeout.
+  LS_CHECK(c.send_all(encode_ultrasonic()));
   std::string line;
-  LS_CHECK(c.recv_until('\n', line, 2000));
+  LS_CHECK(c.recv_frame(line, 2000));
   const reply r = parse_reply(line);
   LS_CHECK(r.has_value);
   LS_CHECK_EQ(r.value, 57L);
   LS_CHECK(range_is_plausible(r.value));
 
   // A drive command is acknowledged.
-  LS_CHECK(c.send_all(encode_left(150) + "\n"));
-  LS_CHECK(c.recv_until('\n', line, 2000));
+  LS_CHECK(c.send_all(encode_left(150)));
+  LS_CHECK(c.recv_frame(line, 2000));
   LS_CHECK(parse_reply(line).affirmative);
 
   LS_CHECK(robot.commands_seen.load() >= 2);
@@ -229,7 +276,7 @@ void a_dead_robot_is_detected() {
 
   // Reads must stop returning data rather than hanging forever.
   std::string line;
-  bool got = c.recv_until('\n', line, 300);
+  bool got = c.recv_frame(line, 300);
   LS_CHECK(!got);
 }
 
@@ -256,6 +303,8 @@ void robot_messages_are_replay_safe() {
 
 int main() {
   commands_encode_exactly();
+  every_command_carries_the_handshake_tag();
+  the_keepalive_is_a_bare_frame();
   reverse_is_encoded_as_direction_zero();
   left_and_right_select_different_motors();
   speeds_below_the_deadband_become_zero();

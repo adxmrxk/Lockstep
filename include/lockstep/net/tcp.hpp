@@ -209,6 +209,31 @@ class tcp_stream {
     return false;
   }
 
+  // Read one brace-delimited frame: {ok}, {ls_52}, {Heartbeat}.
+  //
+  // Firmware that frames with braces does not also send a newline, so a reader
+  // waiting for a newline times out on a reply it already received in full.
+  // `timeout_ms` bounds the wait for a frame to START; once the opening brace
+  // is in hand the rest is already in flight, so the remainder gets a fixed
+  // short window and a frame is never abandoned half-read -- abandoning one
+  // would leave its tail in the socket and desynchronise every later read.
+  bool recv_frame(std::string& out, int timeout_ms, std::size_t limit = 4096) {
+    out.clear();
+    char c = 0;
+    for (;;) {
+      if (recv_some(&c, 1, timeout_ms) <= 0) return false;
+      if (c == '{') break;  // anything outside a frame is noise
+    }
+    out.push_back(c);
+    constexpr int kInFrameTimeoutMs = 500;
+    while (out.size() < limit) {
+      if (recv_some(&c, 1, kInFrameTimeoutMs) <= 0) return false;
+      out.push_back(c);
+      if (c == '}') return true;
+    }
+    return false;
+  }
+
   static bool wait_readable(socket_t s, int timeout_ms) {
     fd_set r;
     FD_ZERO(&r);
