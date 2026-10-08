@@ -37,7 +37,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 
+#include "camera.hpp"
 #include "lockstep/core/process.hpp"
 #include "lockstep/net/tcp.hpp"
 #include "lockstep/pubsub.hpp"
@@ -66,6 +68,17 @@ struct options {
   // Measured replies land at 238-255 ms, so the old 250 ms budget sat exactly
   // on the threshold and dropped readings at random.
   int reply_timeout_ms = 1000;
+  // Camera capture is off by default. It is a second HTTP connection per cycle
+  // to the same ESP32 that is already the suspect in the mid-drive link death,
+  // so turning it on has to be a decision, not a surprise.
+  bool camera = false;
+  std::uint16_t camera_port = 80;
+  std::string camera_path = "/capture";
+  // Deliberately NOT tied to rate_hz. The control loop is 4 Hz because a
+  // command round trip costs ~250 ms, but a camera fetch is a different socket
+  // to a different server and has no such floor. Pinning the two together gave
+  // video at 4 fps, in which the car visibly jumps a foot between frames.
+  int camera_fps = 12;
 };
 
 void usage() {
@@ -78,6 +91,13 @@ void usage() {
       "  --rate <hz>        sensor poll rate (default 4; the car answers in\n"
       "                     ~250ms, so much above 4 Hz is not achievable)\n"
       "  --duration <ms>    run time; 0 or omitted means until Ctrl-C\n"
+      "  --camera           also publish camera frames on robot/camera, so a\n"
+      "                     recording node can save video of the drive\n"
+      "  --camera-port <n>  camera HTTP port (default 80)\n"
+      "  --camera-path <p>  camera HTTP path (default /capture)\n"
+      "  --camera-fps <n>   capture rate (default 12). Independent of --rate:\n"
+      "                     the camera runs on its own thread so that smooth\n"
+      "                     video does not require a faster control loop\n"
       "  --sim              no robot: synthesise sensors, absorb drive commands\n"
       "  --probe            send each command once, print raw replies, exit\n");
 }
@@ -95,6 +115,15 @@ bool parse_args(int argc, char** argv, options& o) {
     if (a == "--sim") o.sim = true;
     else if (a == "--probe") o.probe = true;
     else if (a == "--attach") o.attach = true;
+    else if (a == "--camera") o.camera = true;
+    else if (a == "--camera-port") { const char* v = next("--camera-port");
+                                     if (!v) return false;
+                                     o.camera_port = static_cast<std::uint16_t>(std::atoi(v)); }
+    else if (a == "--camera-path") { const char* v = next("--camera-path");
+                                     if (!v) return false; o.camera_path = v; }
+    else if (a == "--camera-fps") { const char* v = next("--camera-fps");
+                                    if (!v) return false; o.camera_fps = std::atoi(v);
+                                    if (o.camera_fps < 1) o.camera_fps = 1; }
     else if (a == "--help" || a == "-h") { usage(); return false; }
     else if (a == "--host") { const char* v = next("--host"); if (!v) return false; o.host = v; }
     else if (a == "--bus") { const char* v = next("--bus"); if (!v) return false; o.bus = v; }
@@ -304,7 +333,11 @@ int main(int argc, char** argv) {
       b = ls::bus::open(opt.bus);
     } else {
       ls::segment::unlink(opt.bus);
-      b = ls::bus::create(opt.bus, {{64, 512}, {4096, 64}, {65536, 16}});
+      // The 64 KB pool holds camera frames, and it needs more blocks than the
+      // camera ring is deep -- a ring of N claims N blocks, so a pool of
+      // exactly N leaves nothing and create() fails. 40 covers a 16-deep ring
+      // with room to spare.
+      b = ls::bus::create(opt.bus, {{64, 512}, {4096, 64}, {65536, 40}});
     }
   } catch (const std::exception& ex) {
     std::fprintf(stderr, "  [bus] %s\n", ex.what());
@@ -313,8 +346,108 @@ int main(int argc, char** argv) {
   std::printf("  [bus] %s, %llu bytes\n", opt.bus.c_str(),
               static_cast<unsigned long long>(b.seg().size()));
 
-  auto range_pub = ls::publisher<RobotRange>::create(b, robot_topics::range, 64);
-  auto status_pub = ls::publisher<RobotStatus>::create(b, robot_topics::status, 16);
+  // Wrapped, because an uncaught exception here exits the process after the
+  // "[bus] ..." line with NO message at all -- which is exactly how a ring
+  // that would not fit in its pool presented itself: a bridge that appeared to
+  // start and then simply was not there.
+  ls::publisher<RobotRange> range_pub;
+  ls::publisher<RobotStatus> status_pub;
+  try {
+    range_pub = ls::publisher<RobotRange>::create(b, robot_topics::range, 64);
+    status_pub = ls::publisher<RobotStatus>::create(b, robot_topics::status, 16);
+  } catch (const std::exception& ex) {
+    std::fprintf(stderr, "  [bus] cannot create the sensor publishers: %s\n",
+                 ex.what());
+    return 1;
+  }
+
+  // ---- the camera, on its own thread ----
+  //
+  // A fetch blocks for as long as the ESP32 takes to encode and ship a JPEG,
+  // which is tens to hundreds of milliseconds and wholly unrelated to the
+  // control loop's business. Running it inline put the camera's latency into
+  // the steering path AND held the capture rate down to the decision rate, so
+  // video came out at 4 fps with the car lurching between frames.
+  //
+  // On its own thread it captures as fast as the link allows, the control loop
+  // is untouched, and the two rates are free to differ -- which is the whole
+  // reason the recorder drains the topic rather than sampling it once.
+  //
+  // Thread safety: this thread is the ONLY toucher of camera_pub. The main loop
+  // never looks at it. One publisher, one thread, no sharing.
+  ls::publisher<RobotFrame> camera_pub;
+  ls::camera::options cam_opt;
+  std::atomic<std::uint64_t> frames_ok{0}, frames_failed{0};
+  std::atomic<bool> camera_stop{false};
+  std::thread camera_thread;
+
+  if (opt.camera) {
+    try {
+      camera_pub = ls::publisher<RobotFrame>::create(b, robot_topics::camera, 16);
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr,
+                   "  [cam] cannot create the camera topic: %s\n"
+                   "        A frame needs a 64 KB slot. If you are running with"
+                   " --attach, the\n"
+                   "        bus was created by an older build whose pool is too"
+                   " small; restart\n"
+                   "        the owning bridge.\n", ex.what());
+      return 1;
+    }
+    cam_opt.host = opt.host;
+    cam_opt.port = opt.camera_port;
+    cam_opt.path = opt.camera_path;
+    cam_opt.max_bytes = kMaxFrameBytes;
+    std::printf("  [cam] http://%s:%u%s at up to %d fps\n", cam_opt.host.c_str(),
+                static_cast<unsigned>(cam_opt.port), cam_opt.path.c_str(),
+                opt.camera_fps);
+  }
+
+  // The topic exists in --sim so the graph has the same shape either way, but
+  // there is nothing to fetch from, and a capture loop against an absent host
+  // would just burn a 1.5 second connect timeout over and over.
+  if (opt.camera && opt.sim) {
+    std::printf("  [cam] SIMULATED -- no camera to fetch from, no frames\n");
+  } else if (opt.camera) {
+    camera_thread = std::thread([&] {
+      const std::uint64_t period_ns =
+          1000000000ull / static_cast<unsigned>(opt.camera_fps);
+      std::string last_error;
+      std::uint32_t cseq = 0;
+      while (!camera_stop.load(std::memory_order_relaxed) &&
+             !g_stop.load(std::memory_order_relaxed)) {
+        const std::uint64_t started = ls::now_ns();
+        const ls::camera::result cr = ls::camera::fetch_jpeg(cam_opt);
+
+        if (cr.ok) {
+          frames_ok.fetch_add(1, std::memory_order_relaxed);
+          auto ln = camera_pub.loan_message();
+          ln->stamp_ns = ls::now_ns();
+          ln->seq = cseq++;
+          ln->bytes = static_cast<std::uint32_t>(cr.body.size());
+          std::memcpy(ln->data, cr.body.data(), cr.body.size());
+          // The tail of the slot is left as the pool found it. Nothing reads
+          // past `bytes`, and zeroing 60 KB a frame would cost more than the
+          // fetch did.
+          camera_pub.publish(ln);
+          last_error.clear();
+        } else {
+          frames_failed.fetch_add(1, std::memory_order_relaxed);
+          // Only announce a NEW failure. A camera that is off would otherwise
+          // print a dozen identical lines a second and bury the drive.
+          if (cr.error != last_error) {
+            std::printf("  [cam] %s\n", cr.error.c_str());
+            last_error = cr.error;
+          }
+        }
+
+        // Pace to the requested rate. A fetch slower than the period means the
+        // link is the limit, so there is nothing to wait for -- go again.
+        const std::uint64_t spent = ls::now_ns() - started;
+        if (spent < period_ns) ls::sleep_us((period_ns - spent) / 1000u);
+      }
+    });
+  }
 
   // The drive topic is published by whatever control node the user writes, so
   // the bridge has to tolerate it not existing yet -- and has to keep working
@@ -452,6 +585,12 @@ int main(int argc, char** argv) {
     ls::sleep_us(period_us);
   }
 
+  // Stop the camera before anything else. It is holding a socket to the same
+  // ESP32 the stop command has to reach, and the stop is the one message in
+  // this program that must not be delayed.
+  camera_stop.store(true, std::memory_order_relaxed);
+  if (camera_thread.joinable()) camera_thread.join();
+
   // Safety stop. Belt; the firmware failsafe is braces.
   l.exchange(ls::elegoo::encode_stop(), false);
 
@@ -465,5 +604,14 @@ int main(int argc, char** argv) {
       static_cast<unsigned long long>(l.ok()),
       static_cast<unsigned long long>(l.errors()),
       l.connected() ? "connected" : "DISCONNECTED");
+  if (opt.camera) {
+    const std::uint64_t got = frames_ok.load(std::memory_order_relaxed);
+    const double secs = static_cast<double>(ls::now_ns() - t0) / 1e9;
+    std::printf("         camera: %llu frames, %llu failed, %.1f fps achieved\n",
+                static_cast<unsigned long long>(got),
+                static_cast<unsigned long long>(
+                    frames_failed.load(std::memory_order_relaxed)),
+                secs > 0.0 ? static_cast<double>(got) / secs : 0.0);
+  }
   return 0;
 }

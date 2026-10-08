@@ -68,10 +68,36 @@ LOCKSTEP_MESSAGE(RobotStatus, stamp_ns, commands_sent, replies_ok, errors, conne
 static_assert(sizeof(RobotStatus) == 40, "RobotStatus should be padding-free");
 static_assert(!ls::message_traits<RobotStatus>::has_padding, "");
 
+// One JPEG from the car's camera, carried whole.
+//
+// The frame travels as bytes rather than as decoded pixels because nothing on
+// this bus wants pixels: the controller steers on the rangefinder, and the only
+// consumer is the recorder, which writes the JPEG straight into a video file.
+// Decoding it here would cost a 900 KB message to produce something every
+// subscriber would have to re-encode.
+//
+// `data` is a fixed array rather than a pointer because the bus is zero-copy
+// shared memory: a pointer would be meaningless in another process's address
+// space. The cost is that a slot is always kMaxFrameBytes wide whatever the
+// frame weighs, which is the usual zero-copy trade and the reason `bytes` says
+// how much of it is real.
+inline constexpr std::uint32_t kMaxFrameBytes = 65520;
+
+struct RobotFrame {
+  std::uint64_t stamp_ns;
+  std::uint32_t seq;
+  std::uint32_t bytes;     // valid prefix of data; 0 = no frame this cycle
+  std::uint8_t data[kMaxFrameBytes];
+};
+LOCKSTEP_MESSAGE(RobotFrame, stamp_ns, seq, bytes, data);
+static_assert(sizeof(RobotFrame) == 65536, "RobotFrame should fill its pool slot");
+static_assert(!ls::message_traits<RobotFrame>::has_padding, "");
+
 // Topic names, in one place so the bridge and every node agree by construction
 // rather than by both spelling the same string correctly.
 namespace robot_topics {
 inline constexpr const char* range = "robot/range";
 inline constexpr const char* drive = "robot/drive";
 inline constexpr const char* status = "robot/status";
+inline constexpr const char* camera = "robot/camera";
 }  // namespace robot_topics

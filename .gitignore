@@ -7,3 +7,7 @@ CMakeUserPresets.json
 docs/tla/tla2tools.jar
 docs/tla/states/
 docs/tla/*.out
+
+# Recorded runs. A journal with video in it is hundreds of megabytes.
+*.jrnl
+runs/
