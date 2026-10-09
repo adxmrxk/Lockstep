@@ -187,6 +187,156 @@ void a_full_journal_refuses_rather_than_overruns() {
   std::remove(path.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// Ring mode: the flight recorder
+//
+// A robot runs for hours and the interesting thing happens near the end, so a
+// journal that fills up and stops recording is no use in the field. Ring mode
+// keeps the most recent window instead, and snapshot() turns that window into
+// an ordinary journal the existing replay path reads without knowing anything
+// about rotation.
+// ---------------------------------------------------------------------------
+
+// A ring journal keeps recording where a linear one gives up.
+void a_ring_journal_never_stops_accepting_records() {
+  const std::string path = tmp_path("ring");
+  ls::journal j = ls::journal::create_ring(path, 8192);
+  std::uint8_t blob[256] = {};
+
+  // Many times the capacity. A linear journal refuses long before this.
+  for (int i = 0; i < 500; ++i) {
+    LS_CHECK(j.append(ls::record_kind::message, 0,
+                      static_cast<std::uint64_t>(i), 0, blob, sizeof(blob)));
+  }
+  LS_CHECK(j.rotations() > 0);
+  LS_CHECK(j.dropped() > 0);
+
+  // And it stayed inside its budget rather than growing.
+  LS_CHECK(j.used() <= 8192u);
+  LS_CHECK(j.records() < 500u);
+  std::remove(path.c_str());
+}
+
+// The window has to hold the NEWEST records. Keeping the oldest would be a
+// flight recorder that preserves takeoff and loses the crash.
+void a_ring_journal_keeps_the_newest_records() {
+  const std::string path = tmp_path("ringnew");
+  ls::journal j = ls::journal::create_ring(path, 4096);
+  std::uint8_t blob[128] = {};
+  constexpr int kTotal = 300;
+  for (int i = 0; i < kTotal; ++i) {
+    LS_CHECK(j.append(ls::record_kind::message, 0,
+                      static_cast<std::uint64_t>(i), 0, blob, sizeof(blob)));
+  }
+
+  // Records come back oldest first, and the last one must be the last written.
+  ls::record r;
+  std::uint64_t first_seq = 0, last_seq = 0, seen = 0;
+  while (j.next(r)) {
+    if (seen == 0) first_seq = r.sequence;
+    last_seq = r.sequence;
+    ++seen;
+  }
+  LS_CHECK(seen > 0);
+  LS_CHECK_EQ(last_seq, static_cast<std::uint64_t>(kTotal - 1));
+  LS_CHECK(first_seq > 0);                       // the start was discarded
+  LS_CHECK_EQ(seen, j.records());
+
+  // Sequence numbers are contiguous: the window is a run, not a sampling.
+  LS_CHECK_EQ(last_seq - first_seq + 1, seen);
+  std::remove(path.c_str());
+}
+
+// Before the first rotation a ring journal is just a short linear one, and must
+// read back identically.
+void a_ring_journal_reads_in_order_before_it_wraps() {
+  const std::string path = tmp_path("ringsmall");
+  ls::journal j = ls::journal::create_ring(path, 64 * 1024);
+  for (int i = 0; i < 5; ++i) {
+    LS_CHECK(j.append(ls::record_kind::clock, 0,
+                      static_cast<std::uint64_t>(i),
+                      static_cast<std::uint64_t>(i * 10), nullptr, 0));
+  }
+  LS_CHECK_EQ(j.rotations(), 0u);
+  LS_CHECK_EQ(j.dropped(), 0u);
+
+  ls::record r;
+  for (int i = 0; i < 5; ++i) {
+    LS_CHECK(j.next(r));
+    LS_CHECK_EQ(r.value, static_cast<std::uint64_t>(i * 10));
+  }
+  LS_CHECK(!j.next(r));
+  std::remove(path.c_str());
+}
+
+// The point of the whole feature: a snapshot is an ordinary journal.
+void a_snapshot_is_a_plain_journal_that_replays() {
+  const std::string ring_path = tmp_path("ringsnap");
+  const std::string snap_path = tmp_path("snapout");
+
+  std::uint64_t want_records = 0, want_hash = 0;
+  std::uint64_t want_first = 0, want_last = 0;
+  {
+    ls::journal j = ls::journal::create_ring(ring_path, 4096);
+    std::uint8_t blob[96] = {};
+    for (int i = 0; i < 400; ++i) {
+      LS_CHECK(j.append(ls::record_kind::message, 3,
+                        static_cast<std::uint64_t>(i),
+                        static_cast<std::uint64_t>(i), blob, sizeof(blob)));
+    }
+    LS_CHECK(j.rotations() > 0);
+    want_records = j.records();
+    want_hash = j.content_hash();
+
+    ls::record r;
+    std::uint64_t seen = 0;
+    while (j.next(r)) {
+      if (seen == 0) want_first = r.sequence;
+      want_last = r.sequence;
+      ++seen;
+    }
+    LS_CHECK(j.snapshot(snap_path));
+  }
+
+  // Read it with no knowledge that a ring was involved.
+  ls::journal s = ls::journal::open_read(snap_path);
+  LS_CHECK(s.mode() == ls::journal_mode::linear);
+  LS_CHECK_EQ(s.records(), want_records);
+  LS_CHECK_EQ(s.dropped(), 0u);
+
+  // Same records, same order, so the same content hash. This is the property
+  // that makes a snapshot replayable: nothing about it is special.
+  LS_CHECK_EQ(s.content_hash(), want_hash);
+
+  ls::record r;
+  std::uint64_t seen = 0, first = 0, last = 0;
+  while (s.next(r)) {
+    if (seen == 0) first = r.sequence;
+    last = r.sequence;
+    LS_CHECK_EQ(r.callback, 3u);
+    LS_CHECK_EQ(r.bytes, 96u);
+    ++seen;
+  }
+  LS_CHECK_EQ(seen, want_records);
+  LS_CHECK_EQ(first, want_first);
+  LS_CHECK_EQ(last, want_last);
+
+  std::remove(ring_path.c_str());
+  std::remove(snap_path.c_str());
+}
+
+// A record too big for a half can never be written, and must be refused rather
+// than rotating forever looking for room that does not exist.
+void a_record_too_big_for_a_half_is_refused() {
+  const std::string path = tmp_path("ringbig");
+  ls::journal j = ls::journal::create_ring(path, 4096);
+  std::uint8_t big[3000] = {};
+  LS_CHECK(!j.append(ls::record_kind::message, 0, 0, 0, big, sizeof(big)));
+  LS_CHECK_EQ(j.records(), 0u);
+  LS_CHECK_EQ(j.rotations(), 0u);
+  std::remove(path.c_str());
+}
+
 // THE test.
 void a_thousand_replays_all_match() {
   const std::string path = tmp_path("run");
@@ -277,6 +427,11 @@ void the_journal_hash_detects_a_changed_byte() {
 int main() {
   a_journal_round_trips();
   a_full_journal_refuses_rather_than_overruns();
+  a_ring_journal_never_stops_accepting_records();
+  a_ring_journal_keeps_the_newest_records();
+  a_ring_journal_reads_in_order_before_it_wraps();
+  a_snapshot_is_a_plain_journal_that_replays();
+  a_record_too_big_for_a_half_is_refused();
   the_journal_hash_detects_a_changed_byte();
   a_thousand_replays_all_match();
   return ls::test::summary("replay");

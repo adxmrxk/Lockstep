@@ -48,7 +48,8 @@
 
 namespace ls {
 
-inline constexpr std::uint64_t journal_magic = 0x4c534a524e4c3031ull;  // "LSJRNL01"
+inline constexpr std::uint64_t journal_magic = 0x4c534a524e4c3032ull;  // "LSJRNL02"
+inline constexpr std::uint64_t journal_magic_v1 = 0x4c534a524e4c3031ull;
 
 enum class record_kind : std::uint32_t {
   message = 1,
@@ -56,12 +57,43 @@ enum class record_kind : std::uint32_t {
   output = 3,
 };
 
+// How the record area is used.
+//
+//   linear  fill once, from the start, and stop when full. What you want when
+//           recording a bounded run you intend to keep all of.
+//
+//   ring    keep the most recent window and throw the rest away, so a robot can
+//           run for hours inside a fixed amount of memory. What you want when
+//           the interesting thing has not happened yet.
+enum class journal_mode : std::uint32_t { linear = 0, ring = 1 };
+
+// Ring mode splits the record area in two and writes into one half at a time.
+//
+// The obvious design is a byte-level circular buffer, and it is worse. Records
+// are variable length, so a wrapping write either straddles the end of the
+// buffer (now a record is in two pieces and every reader has to know that) or
+// needs skip markers padding out the tail, and evicting the oldest record to
+// make room means walking forward from the head on the hot path.
+//
+// Halves avoid all of it. A record never straddles anything, each half stays an
+// ordinary linear run of records, and rotating is two stores. The cost is that
+// the retained window varies between one half and two, so "keeps the last 30
+// seconds" is really "keeps the last 30 to 60". For a flight recorder that is a
+// fine trade, and it is the same trade perf and most trace buffers make.
 struct journal_header {
   std::uint64_t magic;
-  std::uint64_t capacity;
-  std::uint64_t used;     // bytes of record area consumed
-  std::uint64_t records;  // number of records
+  std::uint64_t capacity;        // bytes in the record area
+  std::uint64_t used;            // live bytes, across both halves in ring mode
+  std::uint64_t records;         // live records
+  std::uint64_t dropped;         // records discarded by rotation
+  std::uint64_t half;            // bytes per half; 0 in linear mode
+  std::uint64_t half_bytes[2];
+  std::uint64_t half_records[2];
+  std::uint32_t mode;
+  std::uint32_t active;          // which half is being written
+  std::uint64_t rotations;
 };
+static_assert(sizeof(journal_header) == 96, "journal header is a fixed layout");
 
 // Fixed-size prefix; `bytes` of payload follow immediately, then padding to the
 // next 8-byte boundary.
@@ -96,7 +128,24 @@ class journal {
   }
   ~journal() { close(); }
 
+  // Fill once and stop when full.
   static journal create(const std::string& path, std::size_t bytes) {
+    return create_with_mode(path, bytes, journal_mode::linear);
+  }
+
+  // Keep the most recent window and discard the rest, so a long-running robot
+  // records continuously inside a fixed budget. The window is between half and
+  // all of `bytes`; see the note on journal_header.
+  //
+  // A ring journal is not meant to be replayed in place, though it can be.
+  // snapshot() is the intended path: it writes the live window out as an
+  // ordinary linear journal, which every existing reader handles unchanged.
+  static journal create_ring(const std::string& path, std::size_t bytes) {
+    return create_with_mode(path, bytes, journal_mode::ring);
+  }
+
+  static journal create_with_mode(const std::string& path, std::size_t bytes,
+                                  journal_mode mode) {
     journal j;
     j.writable_ = true;
     j.size_ = bytes;
@@ -145,10 +194,18 @@ class journal {
 #endif
 
     auto* h = j.hdr();
+    std::memset(static_cast<void*>(h), 0, sizeof(journal_header));
     h->magic = journal_magic;
     h->capacity = bytes - sizeof(journal_header);
-    h->used = 0;
-    h->records = 0;
+    h->mode = static_cast<std::uint32_t>(mode);
+    if (mode == journal_mode::ring) {
+      // Both halves 8-aligned, so a record header is never misaligned.
+      h->half = (h->capacity / 2) & ~7ull;
+      if (h->half == 0) {
+        throw std::runtime_error("lockstep: " + path +
+                                 " is too small for a ring journal");
+      }
+    }
     return j;
   }
 
@@ -206,10 +263,29 @@ class journal {
     j.base_ = static_cast<std::uint8_t*>(p);
 #endif
 
+    if (j.hdr()->magic == journal_magic_v1) {
+      // v1 had a 32 byte header and no ring fields, so its records start where
+      // v2 keeps its bookkeeping. Reading one as v2 would hand back record
+      // bytes as if they were offsets, which fails in confusing ways rather
+      // than obvious ones.
+      throw std::runtime_error("lockstep: " + path +
+                               " is a v1 journal, recorded before ring mode."
+                               " Re-record it.");
+    }
     if (j.hdr()->magic != journal_magic)
       throw std::runtime_error("lockstep: " + path + " is not a lockstep journal");
     return j;
   }
+
+  journal_mode mode() const noexcept {
+    return static_cast<journal_mode>(hdr()->mode);
+  }
+
+  // Records thrown away by rotation. Non-zero means the window moved past the
+  // start of the run, which matters: a snapshot is then a window, not the whole
+  // thing, and its output hash will not match the full run's.
+  std::uint64_t dropped() const noexcept { return hdr()->dropped; }
+  std::uint64_t rotations() const noexcept { return hdr()->rotations; }
 
   bool valid() const noexcept { return base_ != nullptr; }
   std::uint64_t records() const noexcept { return hdr()->records; }
@@ -222,9 +298,37 @@ class journal {
     if (!writable_) return false;
     auto* h = hdr();
     const std::uint64_t need = align8(sizeof(record_header) + bytes);
-    if (h->used + need > h->capacity) return false;
 
-    auto* rh = reinterpret_cast<record_header*>(area() + h->used);
+    std::uint64_t at = 0;
+    if (h->half == 0) {
+      // Linear: one run of records, stop when it is full.
+      if (h->used + need > h->capacity) return false;
+      at = h->used;
+      h->half_bytes[0] = h->used + need;
+      h->half_records[0] = h->records + 1;
+    } else {
+      // Ring: rotate when the active half cannot take the record. The half we
+      // rotate INTO is the older of the two, so its contents are what gets
+      // thrown away, and the half we just finished is kept whole.
+      if (need > h->half) return false;  // never fits, in either half
+      std::uint32_t a = h->active;
+      if (h->half_bytes[a] + need > h->half) {
+        const std::uint32_t other = a ^ 1u;
+        h->dropped += h->half_records[other];
+        h->used -= h->half_bytes[other];
+        h->records -= h->half_records[other];
+        h->half_bytes[other] = 0;
+        h->half_records[other] = 0;
+        h->active = other;
+        ++h->rotations;
+        a = other;
+      }
+      at = static_cast<std::uint64_t>(a) * h->half + h->half_bytes[a];
+      h->half_bytes[a] += need;
+      ++h->half_records[a];
+    }
+
+    auto* rh = reinterpret_cast<record_header*>(area() + at);
     rh->kind = static_cast<std::uint32_t>(kind);
     rh->callback = callback;
     rh->sequence = sequence;
@@ -232,24 +336,58 @@ class journal {
     rh->bytes = bytes;
     rh->reserved = 0;
     if (bytes > 0 && payload != nullptr)
-      std::memcpy(area() + h->used + sizeof(record_header), payload, bytes);
+      std::memcpy(area() + at + sizeof(record_header), payload, bytes);
 
     h->used += need;
     ++h->records;
     return true;
   }
 
-  // Sequential read. Returns false at the end.
+  // Write the live window out as an ordinary LINEAR journal.
+  //
+  // This is how a ring journal becomes something you replay: the result has no
+  // ring bookkeeping, holds the records in order, and is read by code that
+  // knows nothing about rotation.
+  //
+  // NOT signal-safe. It opens a file and maps it, so a crash handler should set
+  // a flag and let the main loop call this.
+  bool snapshot(const std::string& path) const {
+    auto* h = hdr();
+    try {
+      journal out = create(path, sizeof(journal_header) + h->used + 64);
+      record r;
+      const std::uint64_t saved = cursor_;
+      cursor_ = 0;
+      while (next(r)) {
+        if (!out.append(r.kind, r.callback, r.sequence, r.value, r.payload,
+                        r.bytes)) {
+          cursor_ = saved;
+          return false;
+        }
+      }
+      cursor_ = saved;
+      return true;
+    } catch (const std::exception&) {
+      return false;
+    }
+  }
+
+  // Sequential read, oldest record first. Returns false at the end.
+  //
+  // `cursor_` counts bytes through the LIVE window rather than through the
+  // file, so that ring mode reads in age order without every caller having to
+  // know which half is older. physical() does the mapping.
   bool next(record& out) const noexcept {
     auto* h = hdr();
     if (cursor_ >= h->used) return false;
-    const auto* rh = reinterpret_cast<const record_header*>(area() + cursor_);
+    const std::uint64_t at = physical(cursor_);
+    const auto* rh = reinterpret_cast<const record_header*>(area() + at);
     out.kind = static_cast<record_kind>(rh->kind);
     out.callback = rh->callback;
     out.sequence = rh->sequence;
     out.value = rh->value;
     out.bytes = rh->bytes;
-    out.payload = rh->bytes ? (area() + cursor_ + sizeof(record_header)) : nullptr;
+    out.payload = rh->bytes ? (area() + at + sizeof(record_header)) : nullptr;
     cursor_ += align8(sizeof(record_header) + rh->bytes);
     return true;
   }
@@ -270,13 +408,14 @@ class journal {
     std::uint64_t c = 0;
     auto* h = hdr();
     while (c < h->used) {
-      const auto* rh = reinterpret_cast<const record_header*>(area() + c);
+      const std::uint64_t at = physical(c);
+      const auto* rh = reinterpret_cast<const record_header*>(area() + at);
       mix(&rh->kind, sizeof(rh->kind));
       mix(&rh->callback, sizeof(rh->callback));
       mix(&rh->sequence, sizeof(rh->sequence));
       mix(&rh->value, sizeof(rh->value));
       mix(&rh->bytes, sizeof(rh->bytes));
-      if (rh->bytes) mix(area() + c + sizeof(record_header), rh->bytes);
+      if (rh->bytes) mix(area() + at + sizeof(record_header), rh->bytes);
       c += align8(sizeof(record_header) + rh->bytes);
     }
     return hv;
@@ -306,6 +445,27 @@ class journal {
     return reinterpret_cast<journal_header*>(base_);
   }
   std::uint8_t* area() const noexcept { return base_ + sizeof(journal_header); }
+
+  // Logical byte offset in the live window, to a byte offset in the record
+  // area.
+  //
+  // Linear mode is the identity. Ring mode reads the older half first, which
+  // is the one that is NOT active once anything has rotated. Before the first
+  // rotation only half 0 has ever been written, so there is nothing to put in
+  // front of it.
+  std::uint64_t physical(std::uint64_t logical) const noexcept {
+    auto* h = hdr();
+    if (h->half == 0) return logical;
+    const std::uint32_t first =
+        h->rotations > 0 ? (h->active ^ 1u) : h->active;
+    const std::uint64_t first_bytes = h->half_bytes[first];
+    if (logical < first_bytes) {
+      return static_cast<std::uint64_t>(first) * h->half + logical;
+    }
+    const std::uint32_t second = first ^ 1u;
+    return static_cast<std::uint64_t>(second) * h->half +
+           (logical - first_bytes);
+  }
 
   void swap(journal& o) noexcept {
     std::swap(base_, o.base_);

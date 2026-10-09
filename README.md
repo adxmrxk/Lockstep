@@ -26,7 +26,7 @@ instead of migrating to. Nobody rewrites a robot to try a message bus.
 
 ## Where this actually is
 
-Phases 1 through 7 are built, phase 8 is partly done. 19 tests on GCC 13.3,
+Phases 1 through 7 are built, phase 8 is partly done. 20 tests on GCC 13.3,
 Clang and MSVC 19.29, 20 with a ROS 2 install. Three of them assert that code
 *fails* to compile.
 
@@ -143,6 +143,68 @@ cases. All three zero their unused capacity, which is a determinism requirement
 and not tidiness: a recycled slot still holding the last message's bytes would
 change a replay hash taken over the whole slot.
 
+You don't have to design your own types to get started.
+[include/lockstep/msgs/robotics.hpp](include/lockstep/msgs/robotics.hpp) has the
+ones nearly every robot has: `Imu`, `Range`, `Pose`, `Twist`, `Odometry`,
+`JointState`, `Transform`, `BatteryState`. They're modelled on the ROS
+common_interfaces so the mapping is obvious, and every one is padding-free with
+an assert holding it that way.
+
+## Recording a long run
+
+A journal that fills up and stops is no use on a robot that runs for hours
+before it misbehaves. Ring mode keeps the most recent window instead, inside a
+fixed budget, and writes a snapshot when something goes wrong:
+
+```sh
+avoider --journal live.jrnl --ring --journal-mb 256 --blind-trigger 8
+```
+
+Triggers are the sensor going blind for N reads in a row, Ctrl-C, and the end of
+the run. Each one drops a file in `runs/snapshots/` that replays like any other
+journal, because that's exactly what it is: `snapshot()` writes the live window
+out as an ordinary linear journal, so nothing downstream needs to know a ring
+was involved.
+
+Two halves rather than a byte-level circular buffer. A wrapping write would
+either straddle the end of the buffer, leaving a record in two pieces that every
+reader has to know about, or need skip markers padding the tail, and evicting
+the oldest record would mean walking the head forward on the hot path. With
+halves a record never straddles anything and rotating is two stores. The cost is
+that the window varies between one half and two, so "the last 30 seconds" is
+really "the last 30 to 60". Same trade perf and most trace buffers make.
+
+Verified: a snapshot of a rotated ring replays to the same hash as the live run
+it came from.
+
+## Reading a journal from Python
+
+Everyone who actually debugs robots lives in Python, and a bus with no analysis
+story gets looked at only from inside the C++ process.
+[tools/journal.py](tools/journal.py) is stdlib only, with pandas used if you
+have it:
+
+```sh
+python tools/journal.py drive.jrnl                 # what's in it
+python tools/journal.py drive.jrnl --csv out.csv   # readings as CSV
+python tools/journal.py drive.jrnl --frames ./pics # pull the JPEGs out
+```
+
+```
+drive.jrnl
+  mode            ring
+  records         13710 live
+  rotations       1
+  clock span      104.97 s
+  by kind         clock 6855, message 6855
+  range readings  6855, 6670 valid (97 percent)
+```
+
+One limitation worth stating: a journal records a message's bytes, not its type.
+The layout hash lives in the bus registry, not in each record, so decoding is
+keyed on payload size plus callback id. That's enough for the handful of types
+any one node records, and it is not a general deserializer.
+
 ## Build and test
 
 CMake 3.20 or newer, and a C++20 compiler.
@@ -154,7 +216,7 @@ ctest --test-dir build --output-on-failure
 ```
 
 ```
-100% tests passed, 0 tests failed out of 19
+100% tests passed, 0 tests failed out of 20
 ```
 
 On Windows, `scripts\build.bat` and `scripts\test.bat` do the same under MSVC.
@@ -435,9 +497,12 @@ include/lockstep/
   pubsub.hpp                loan / publish / subscribe
   rt/executor.hpp           fixed-priority dispatch, allocation-free
   rt/response_time.hpp      Joseph-Pandya worst-case response time
-  replay/journal.hpp        journal, deterministic clock, output hashing
+  replay/journal.hpp        journal, ring mode, deterministic clock, hashing
+  msgs/robotics.hpp         the messages nearly every robot has
   net/tcp.hpp               the only socket code
-tools/lockstep_top.cpp      live read-only view of a running bus
+tools/
+  lockstep_top.cpp          live read-only view of a running bus
+  journal.py                read a journal from Python, export CSV or frames
 robot/ros2/                 flat ROS equivalents, conversions, bridge node
 robot/elegoo/
   protocol.hpp              the Elegoo wire format, verified against firmware

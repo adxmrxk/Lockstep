@@ -22,6 +22,8 @@
 // goes. The journal is the authoritative record and the only thing a replay
 // reads; the transcript is there so that after a drive goes wrong you can open
 // a file and see what happened without running anything.
+#include <atomic>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +39,16 @@
 #include "robot_msgs.hpp"
 
 namespace {
+
+// Ctrl-C has to be survivable, not fatal.
+//
+// Killed outright, a run loses the end of its video (the frame count and index
+// are written at close) and never takes its snapshot. Catching the signal and
+// leaving the loop normally means both still happen, which matters most in
+// exactly the case you are most likely to hit Ctrl-C: something went wrong and
+// you want the recording.
+std::atomic<bool> g_stop{false};
+extern "C" void on_signal(int) { g_stop.store(true, std::memory_order_relaxed); }
 
 // Tuning. Deliberately crude -- the interesting part is reproducibility, not
 // the sophistication of the controller.
@@ -95,6 +107,13 @@ struct options {
   // 0 means measure the real rate from the frames rather than assert one.
   int video_fps = 0;
   int journal_mb = 128;
+  // Flight recorder: keep a rolling window instead of filling up and stopping,
+  // and write a snapshot of it when something goes wrong. For a robot that runs
+  // for hours before misbehaving, this is the difference between a recording
+  // you can use and a journal that stopped two minutes in.
+  bool ring = false;
+  // Consecutive blind sensor reads that trip a snapshot. 0 turns it off.
+  int blind_trigger = 8;
   bool trace = false;
   bool write_log = true;
   bool write_video = true;
@@ -257,7 +276,8 @@ struct run_stats {
   }
 
   void write(std::FILE* f, std::uint64_t hash, const std::string& journal,
-             const std::string& video_note) const {
+             const std::string& video_note,
+             const std::string& snapshot_note = std::string()) const {
     const double blind_s = worst_blind_to_s - worst_blind_from_s;
     const double pct = decisions > 0
         ? 100.0 * static_cast<double>(good_reads) / static_cast<double>(decisions)
@@ -290,6 +310,9 @@ struct run_stats {
     if (!video_note.empty()) {
       std::fprintf(f, "  video                %s\n", video_note.c_str());
     }
+    if (!snapshot_note.empty()) {
+      std::fprintf(f, "  snapshot             %s\n", snapshot_note.c_str());
+    }
 
     std::fprintf(f, "\n  output hash          %016llx\n",
                  static_cast<unsigned long long>(hash));
@@ -320,6 +343,9 @@ std::filesystem::path logs_dir(const std::string& root) {
 }
 std::filesystem::path videos_dir(const std::string& root) {
   return std::filesystem::path(root) / "videos";
+}
+std::filesystem::path snapshots_dir(const std::string& root) {
+  return std::filesystem::path(root) / "snapshots";
 }
 
 // The readable transcript: runs/logs/run_1.txt, run_2.txt, ... Written by every
@@ -375,9 +401,10 @@ class run_log {
   }
 
   void finish(const run_stats& stats, std::uint64_t hash,
-              const std::string& journal, const std::string& video_note) {
+              const std::string& journal, const std::string& video_note,
+              const std::string& snapshot_note = std::string()) {
     if (f_ == nullptr) return;
-    stats.write(f_, hash, journal, video_note);
+    stats.write(f_, hash, journal, video_note, snapshot_note);
     std::fflush(f_);
   }
 
@@ -507,6 +534,11 @@ void usage() {
       "  --video-fps <n>   force the video's playback rate. Omitted, the real\n"
       "                    rate is measured from the frames themselves\n"
       "  --journal-mb <n>  journal size in MB (default 128; video needs room)\n"
+      "  --ring            flight recorder: keep a rolling window of the last\n"
+      "                    --journal-mb instead of stopping when full, and dump\n"
+      "                    a replayable snapshot when something goes wrong\n"
+      "  --blind-trigger <n>  snapshot after n blind sensor reads in a row\n"
+      "                    (default 8, 0 disables)\n"
       "  --duration <ms>   run time; 0 means until the bridge stops\n");
 }
 
@@ -616,6 +648,10 @@ int main(int argc, char** argv) {
     else if (a == "--journal-mb") { const char* v = next(); if (!v) return 1;
                                     opt.journal_mb = std::atoi(v);
                                     if (opt.journal_mb < 1) opt.journal_mb = 1; }
+    else if (a == "--ring") { opt.ring = true; }
+    else if (a == "--blind-trigger") { const char* v = next(); if (!v) return 1;
+                                       opt.blind_trigger = std::atoi(v);
+                                       if (opt.blind_trigger < 0) opt.blind_trigger = 0; }
     else if (a == "--bus") { const char* v = next(); if (!v) return 1; opt.bus = v; }
     else if (a == "--journal") { const char* v = next(); if (!v) return 1; opt.journal = v; }
     else if (a == "--replay") { const char* v = next(); if (!v) return 1; opt.replay = v; }
@@ -625,6 +661,11 @@ int main(int argc, char** argv) {
   }
 
   if (!opt.replay.empty()) return run_replay(opt);
+
+  std::signal(SIGINT, on_signal);
+#if defined(SIGTERM)
+  std::signal(SIGTERM, on_signal);
+#endif
 
   std::printf("avoider\n=======\n");
 
@@ -672,10 +713,12 @@ int main(int argc, char** argv) {
     // rounding error, but a camera frame is tens of kilobytes and the capture
     // thread runs at 10-15 Hz, so a half-minute drive is a few hundred
     // megabytes short of nothing and comfortably past the old 32 MB.
-    jr = ls::journal::create(opt.journal,
-                             static_cast<std::size_t>(opt.journal_mb) << 20);
-    std::printf("  recording to %s (%d MB)\n", opt.journal.c_str(),
-                opt.journal_mb);
+    const std::size_t jbytes = static_cast<std::size_t>(opt.journal_mb) << 20;
+    jr = opt.ring ? ls::journal::create_ring(opt.journal, jbytes)
+                  : ls::journal::create(opt.journal, jbytes);
+    std::printf("  recording to %s (%d MB, %s)\n", opt.journal.c_str(),
+                opt.journal_mb,
+                opt.ring ? "rolling window" : "fills once then stops");
   }
   ls::deterministic_clock clk(recording ? ls::run_mode::record : ls::run_mode::live,
                               recording ? &jr : nullptr);
@@ -703,7 +746,39 @@ int main(int argc, char** argv) {
   bool have_log_t0 = false;
   run_stats stats;
 
+  // Snapshot bookkeeping. A trigger fires at most once per run: the first time
+  // something goes wrong is the interesting one, and a robot that stays broken
+  // would otherwise write a snapshot on every cycle for the rest of the drive.
+  bool snapshot_taken = false;
+  std::string snapshot_note;
+  const auto take_snapshot = [&](const char* reason) {
+    if (snapshot_taken || !recording || !opt.ring) return;
+    snapshot_taken = true;
+    std::error_code ec;
+    const std::filesystem::path dir = snapshots_dir(opt.runs_dir);
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return;
+    const std::string path =
+        (dir / (local_datestamp() + "_run_" + std::to_string(log.number()) +
+                "_" + reason + ".jrnl")).string();
+    if (!jr.snapshot(path)) return;
+    snapshot_note = path + "  (" + reason + ", " +
+                    std::to_string(jr.records()) + " records";
+    if (jr.dropped() > 0) {
+      snapshot_note += ", " + std::to_string(jr.dropped()) + " older dropped";
+    }
+    snapshot_note += ")";
+    std::printf("\n  >>> SNAPSHOT TAKEN: %s\n"
+                "      replay it with: avoider --replay %s --trace\n\n",
+                reason, path.c_str());
+  };
+
   for (;;) {
+    if (g_stop.load(std::memory_order_relaxed)) {
+      std::printf("\n  interrupted, closing the recording cleanly\n");
+      take_snapshot("interrupted");
+      break;
+    }
     if (opt.duration_ms > 0 &&
         (ls::now_ns() - t0) / 1000000u >= static_cast<std::uint64_t>(opt.duration_ms)) {
       break;
@@ -739,6 +814,15 @@ int main(int argc, char** argv) {
     write_table_row(stdout, decisions - 1, elapsed_s, r, d, note);
     log.row(decisions - 1, elapsed_s, r, d, note);
 
+    // The trigger. A sensor that has stopped answering for this many reads in
+    // a row is the failure this robot actually has, and catching it here is the
+    // difference between a snapshot of the fault and a snapshot of whatever the
+    // robot was doing when the clock ran out.
+    if (opt.blind_trigger > 0 &&
+        stats.blind_streak == static_cast<std::uint64_t>(opt.blind_trigger)) {
+      take_snapshot("sensor-blind");
+    }
+
     // ---- camera, AFTER the clock read above ----
     //
     // The ordering is load bearing, not stylistic. See kFrameCallback: a record
@@ -770,9 +854,14 @@ int main(int argc, char** argv) {
     drive_pub.publish(ln);
   }
 
+  // Always leave a snapshot behind in ring mode, even on a clean run. The
+  // rolling journal itself is a window with rotation bookkeeping in it; the
+  // snapshot is the thing you replay.
+  take_snapshot("end-of-run");
+
   const std::string video_note = video.close();
-  log.finish(stats, out.value(), opt.journal, video_note);
-  stats.write(stdout, out.value(), opt.journal, video_note);
+  log.finish(stats, out.value(), opt.journal, video_note, snapshot_note);
+  stats.write(stdout, out.value(), opt.journal, video_note, snapshot_note);
   if (stale > 0) {
     std::printf("  (%llu samples dropped because the bridge overtook us)\n",
                 static_cast<unsigned long long>(stale));

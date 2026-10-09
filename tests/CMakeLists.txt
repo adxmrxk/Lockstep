@@ -56,7 +56,8 @@ if(UNIX OR WIN32)
     test_ring
     test_pubsub
     test_executor
-    test_replay)
+    test_replay
+    test_msgs)
 
   foreach(t IN LISTS LOCKSTEP_SHM_TESTS)
     add_executable(${t} ${t}.cpp)
